@@ -7,7 +7,7 @@ const os = require('node:os')
 const path = require('node:path')
 const http = require('node:http')
 const net = require('node:net')
-const { CoreManager, controller, freePort } = require('../electron/core-manager.cjs')
+const { CoreManager, controller, freePort, reservePort } = require('../electron/core-manager.cjs')
 
 const corePath = process.env.QALETX_TEST_CORE || path.join(__dirname, '..', 'core', process.platform === 'win32' ? 'sing-box.exe' : process.platform === 'darwin' ? `sing-box-${process.arch === 'arm64' ? 'arm64' : 'amd64'}` : 'sing-box')
 const hasCore = fs.existsSync(corePath)
@@ -374,6 +374,25 @@ test('production proxy port defaults to 10808 and invalid overrides are rejected
       assert.throws(() => new CoreManager({ proxyPort: value }), /代理端口/)
     }
   } finally { await context.cleanup() }
+})
+
+test('a background client cannot keep the temporary proxy-port reservation open', async () => {
+  const port=await freePort()
+  const release=await reservePort(port)
+  const client=net.connect({host:'127.0.0.1',port})
+  client.on('error',()=>{})
+  try {
+    await new Promise((resolve,reject)=>{client.once('connect',resolve);client.once('error',reject)})
+    await Promise.race([
+      release(),
+      pause(1500).then(()=>{throw new Error('temporary port still waits for a background client')})
+    ])
+    assert.equal(await new Promise(resolve=>{
+      const server=net.createServer()
+      server.once('error',()=>resolve(false))
+      server.listen(port,'127.0.0.1',()=>server.close(()=>resolve(true)))
+    }),true)
+  } finally {client.destroy();await release().catch(()=>{})}
 })
 
 test('occupied configured proxy port is reported without spawning or taking over another process', { skip: !hasCore }, async () => {

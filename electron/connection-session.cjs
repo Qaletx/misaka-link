@@ -4,7 +4,7 @@ const fingerprint=uri=>crypto.createHash('sha256').update(uri).digest('hex')
 class ConnectionSession {
   constructor({manager,createProbe,account=new AccountSession(),interval=15000}) {
     Object.assign(this,{manager,createProbe,account,interval})
-    this.generation=0;this.connectionEpoch=0;this.probe=null;this.active=null;this.timer=null;this.failures=0;this.checking=null;this.mutations=Promise.resolve()
+    this.generation=0;this.connectionEpoch=0;this.probe=null;this.active=null;this.timer=null;this.failures=0;this.checking=null;this.mutations=Promise.resolve();this.connectionsInFlight=0
     this.manager.on('status',state=>{if(!['connected','connecting'].includes(state.phase))this.stopWatch()})
   }
   stopWatch(){clearInterval(this.timer);this.timer=null;this.active=null;this.failures=0;this.checking=null}
@@ -29,6 +29,7 @@ class ConnectionSession {
     const result=this.mutations.then(task,task);this.mutations=result.catch(()=>{});return result
   }
   async connect(payload) {
+    this.connectionsInFlight++
     const generation=this.generation,attempt=++this.connectionEpoch
     const current=()=>generation===this.generation&&attempt===this.connectionEpoch
     const cancelled=()=>({ok:false,message:'连接已取消'})
@@ -59,7 +60,7 @@ class ConnectionSession {
       if(!current())return cancelled()
       this.manager.update({phase:'error',stage:'',error:error.message})
       return {ok:false,message:error.message}
-    }
+    }finally{this.connectionsInFlight--}
   }
   disconnect(){++this.connectionEpoch;this.stopWatch();return this.manager.disconnect()}
   async testNode(payload) {

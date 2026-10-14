@@ -19,15 +19,28 @@ function freePort() {
 }
 function reservePort(port) {
   return new Promise((resolve,reject)=>{
-    const server=net.createServer()
+    // This temporary listener only reserves the port. Other applications may
+    // still try to use the previous proxy endpoint while we validate a node.
+    // Never retain those sockets: server.close() waits for every client to end.
+    const sockets=new Set()
+    const server=net.createServer(socket=>{
+      sockets.add(socket)
+      socket.on('error',()=>{})
+      socket.on('close',()=>sockets.delete(socket))
+      socket.destroy()
+    })
     server.once('error',()=>reject(new Error(`本地代理端口 ${port} 已被占用或无法使用，请关闭占用该端口的软件后重试`)))
     server.listen({port,host:'127.0.0.1',exclusive:true},()=>{
-      let released=false
-      resolve(()=>new Promise(done=>{
-        if(released) return done()
-        released=true
-        server.close(done)
-      }))
+      let closing
+      resolve(()=>{
+        if(closing) return closing
+        closing=new Promise((done,fail)=>{
+          const timer=setTimeout(()=>fail(new Error(`释放本地代理端口 ${port} 超时，请重试`)),2000)
+          server.close(error=>{clearTimeout(timer);error?fail(error):done()})
+          for(const socket of sockets) socket.destroy()
+        })
+        return closing
+      })
     })
   })
 }
@@ -186,7 +199,7 @@ class CoreManager extends EventEmitter {
       this.log('error',this.state.error)
       return {ok:false,message:this.state.error}
     } finally {
-      if(releasePort) await releasePort()
+      if(releasePort) try { await releasePort() } catch(error) { this.log('warn',error.message) }
       if(configPath) try { fs.unlinkSync(configPath) } catch {}
       if(this.connectionAbort===abort) this.connectionAbort=null
     }
@@ -210,4 +223,4 @@ class CoreManager extends EventEmitter {
     return {ok:!restoreError,message:restoreError||'已断开连接'}
   }
 }
-module.exports={CoreManager,controller,freePort,httpProbe}
+module.exports={CoreManager,controller,freePort,httpProbe,reservePort}

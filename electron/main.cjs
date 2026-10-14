@@ -7,10 +7,12 @@ const {SystemProxy}=require('./system-proxy.cjs')
 const {describeNode}=require('./protocols.cjs')
 const {NodeProbe}=require('./node-probe.cjs')
 const {ConnectionSession}=require('./connection-session.cjs')
+const {validProxyPort,loadProxyPort,saveProxyPort}=require('./preferences.cjs')
 if(!app.isPackaged && process.env.QALETX_TEST_PROFILE) app.setPath('userData',process.env.QALETX_TEST_PROFILE)
 let mainWindow,tray,manager,accountSession,quitting=false,quitReady=false
 const dataPath=app.getPath('userData')
 const journal=path.join(dataPath,'proxy-recovery.json')
+const preferencesFile=path.join(dataPath,'preferences.json')
 const proxy=new SystemProxy(journal)
 function asset(name) {
   return [path.join(process.resourcesPath,'assets',name),path.join(__dirname,'..','assets',name)].find(p=>fs.existsSync(p))
@@ -90,16 +92,26 @@ else {
   app.on('second-instance',()=>{if(manager) showWindow()})
   app.whenReady().then(async()=>{
     Menu.setApplicationMenu(null)
-    manager=new CoreManager({binary:locateCore(),directory:path.join(dataPath,'sessions'),proxy,onSpawn:guardian})
+    manager=new CoreManager({binary:locateCore(),directory:path.join(dataPath,'sessions'),proxy,onSpawn:guardian,proxyPort:loadProxyPort(preferencesFile)})
     accountSession=new ConnectionSession({manager,createProbe:()=>new NodeProbe({binary:locateCore(),directory:path.join(dataPath,'probes'),onSpawn:guardian})})
     try { await proxy.restore() } catch { manager.update({phase:'error',systemProxy:true,error:'上次代理设置恢复失败，请在系统网络设置关闭代理后重试'});manager.log('error','启动时代理恢复失败') }
     const sessions=path.join(dataPath,'sessions')
     if(fs.existsSync(sessions)) for(const name of fs.readdirSync(sessions)) if(/^session-[a-f0-9]+\.json$/.test(name)) try{fs.unlinkSync(path.join(sessions,name))}catch{}
-    handle('app:get-info',()=>({platform:process.platform,version:app.getVersion(),core:Boolean(locateCore()),coreName:'sing-box',privateNodeSource:'server',port:10808,tray:Boolean(tray)}))
+    handle('app:get-info',()=>({platform:process.platform,version:app.getVersion(),core:Boolean(locateCore()),coreName:'sing-box',privateNodeSource:'server',port:manager.proxyPort,tray:Boolean(tray)}))
     handle('account:set-session',credentials=>accountSession.setSession(credentials))
     handle('account:clear-session',()=>accountSession.clearSession())
     handle('core:get-status',()=>manager.status())
     handle('core:get-logs',()=>manager.logs.slice())
+    handle('core:set-port',port=>{
+      if(!validProxyPort(port)) return {ok:false,message:'本地代理端口必须为 1–65535 之间的整数'}
+      const state=manager.status()
+      if(accountSession.connectionsInFlight||state.connected||state.systemProxy||['connecting','disconnecting'].includes(state.phase)) return {ok:false,message:'请先断开连接并等待当前操作完成，再修改代理端口'}
+      try { saveProxyPort(preferencesFile,port) }
+      catch { return {ok:false,message:'端口设置保存失败，请检查应用数据目录权限'} }
+      manager.proxyPort=port
+      manager.update({port,error:'',phase:'idle'})
+      return {ok:true,port}
+    })
     handle('nodes:validate',text=>{
       if(typeof text!=='string'||text.length>262144) return {ok:false,nodes:[],errors:['导入内容过大']}
       const nodes=[],errors=[]; const seen=new Set()

@@ -34,15 +34,18 @@ async function run() {
     const db = { nodes: [{ ...privateNode }, ...(account.role === 'shared' ? [] : [{ ...personalNode }])], users: [user('root', 'admin', true), user('customer', 'user'), user('shared-team', 'shared')], requests: [], conflict: false, failImport: false, failList: false }
     await context.addInitScript(({ account }) => {
       window.__ipc = []
+      window.__status = { phase: 'idle', connected: false, port: 10808 }
+      window.__emitStatus = value => { window.__status = { ...window.__status, ...value }; window.__statusListener?.(window.__status) }
       if (!localStorage.getItem('misakaAccount')) localStorage.setItem('misakaAccount', JSON.stringify({ ...account, token: `fixture-${account.username}`, apiUrl: 'http://fixture.invalid' }))
       window.misaka = {
         setSession: async value => { window.__ipc.push({ op: 'setSession', value }); return { ok: true, user: account } },
         clearSession: async () => { window.__ipc.push({ op: 'clearSession' }); return { ok: true } },
         getInfo: async () => ({ version: '0.5.0', core: true, coreName: 'sing-box', platform: 'win32' }),
-        getStatus: async () => ({ phase: 'idle', connected: false, port: 10808 }),
-        onStatus: () => () => {}, getLogs: async () => [],
-        connect: async value => { window.__ipc.push({ op: 'connect', value }); if (window.__holdConnect) await new Promise(resolve => { window.__releaseConnect = resolve }); return { ok: true } },
-        disconnect: async () => { window.__ipc.push({ op: 'disconnect' }); window.__holdConnect = false; window.__releaseConnect?.(); return { ok: true } },
+        getStatus: async () => window.__status,
+        onStatus: callback => { window.__statusListener = callback; return () => { window.__statusListener = null } }, getLogs: async () => [],
+        setProxyPort: async value => { window.__ipc.push({ op: 'setProxyPort', value }); window.__emitStatus({ port: value }); return { ok: true, port: value } },
+        connect: async value => { window.__ipc.push({ op: 'connect', value }); if (window.__holdConnect) await new Promise(resolve => { window.__releaseConnect = resolve }); if (window.__simulateConnection) window.__emitStatus({ phase: 'connected', connected: true, nodeId: value.nodeId || value.id }); return { ok: true } },
+        disconnect: async () => { window.__ipc.push({ op: 'disconnect' }); window.__holdConnect = false; window.__releaseConnect?.(); if (window.__simulateConnection) window.__emitStatus({ phase: 'idle', connected: false }); return { ok: true } },
         testNode: async value => { window.__ipc.push({ op: 'testNode', value }); await new Promise(resolve => setTimeout(resolve, 20)); return { ok: true, latencyMs: 42, checkedAt: Date.now() } },
         validateNodes: async value => ({ nodes: value.split('\n').filter(line => /^socks5:\/\//.test(line)).map(uri => ({ uri, name: decodeURIComponent(uri.split('#')[1] || 'Imported'), protocol: 'SOCKS5' })), errors: [] })
       }
@@ -152,6 +155,36 @@ async function run() {
     assert.equal(db.users.find(item => item.username === 'customer').privateNodeAccess, false)
     await admin.context.close()
 
+    const switching = await fixture(user('switcher', 'user'))
+    const switchPage = switching.page
+    await switchPage.getByRole('button', { name: '切换线路', exact: true }).click()
+    const switchDialog = switchPage.getByRole('dialog')
+    await switchDialog.locator('.node-card').filter({ hasText: '我的备用线路' }).locator('.node-select').click()
+    assert.equal(await switchPage.locator('.nodes-preview .node-main strong').innerText(), '专属主线路', 'selection stays pending until confirmation')
+    await switchDialog.getByRole('button', { name: '关闭对话框' }).click()
+    assert.equal(await switchPage.locator('.nodes-preview .node-main strong').innerText(), '专属主线路', 'closing discards draft selection')
+    await switchPage.getByRole('button', { name: '切换线路', exact: true }).click()
+    await switchDialog.locator('.node-card').filter({ hasText: '我的备用线路' }).locator('.node-select').click()
+    await switchDialog.getByRole('button', { name: '确认选择' }).click()
+    assert.equal(await switchPage.locator('.nodes-preview .node-main strong').innerText(), '我的备用线路')
+    assert.equal((await switchPage.evaluate(() => window.__ipc)).filter(item => item.op === 'connect').length, 0, 'disconnected selection does not connect before the user clicks')
+    await switchPage.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: '偏好设置' }).click()
+    await switchPage.getByLabel('监听端口').fill('12080')
+    await switchPage.getByRole('button', { name: '保存端口' }).click()
+    await switchPage.getByText('127.0.0.1:12080').waitFor()
+    assert.ok((await switchPage.evaluate(() => window.__ipc)).some(item => item.op === 'setProxyPort' && item.value === 12080))
+    await switchPage.getByRole('button', { name: '恢复默认' }).click()
+    await switchPage.getByRole('button', { name: '保存端口' }).click()
+    await switchPage.getByText('127.0.0.1:10808').waitFor()
+    await switchPage.getByRole('button', { name: '关闭对话框' }).click()
+    await switchPage.evaluate(() => { window.__simulateConnection = true; window.__emitStatus({ phase: 'connected', connected: true, nodeId: 'personal-one' }) })
+    await switchPage.getByRole('button', { name: '切换线路', exact: true }).click()
+    await switchDialog.locator('.node-card').filter({ hasText: '专属主线路' }).locator('.node-select').click()
+    await switchDialog.getByRole('button', { name: '确认切换并连接' }).click()
+    await switchPage.getByText('已切换并连接 专属主线路').waitFor()
+    assert.ok((await switchPage.evaluate(() => window.__ipc)).some(item => item.op === 'connect' && item.value.nodeId === 'private-one'))
+    await switching.context.close()
+
     const common = await fixture(user('shared-one', 'shared'))
     await common.page.locator('.sidebar-account').click()
     assert.equal(await common.page.getByRole('button', { name: '修改密码', exact: true }).count(), 0)
@@ -208,7 +241,7 @@ async function run() {
     assert.equal(await delegated.page.locator('option[value="admin"]').count(), 0)
     await delegated.context.close()
     assert.deepEqual(errors, [])
-    console.log(JSON.stringify({ rendererV05: 'passed', roles: ['root', 'admin', 'user', 'shared'], checks: ['compact-layout', 'session-initialization', 'private-no-export', 'measured-latency', 'cloud-rename-note', 'revision-conflict-preserves-input', 'private-conversion', 'private-assignment', 'shared-creation', 'private-master-switch', 'shared-no-password', 'shared-local-only', 'cloud-failure-preserves-input', 'cloud-reload-sync', 'admin-cannot-create-admin', 'private-uri-single-and-valid', 'stale-grant-filter', 'legacy-no-auto-upload', 'empty-authorized-list'], systemProxyModified: false }))
+    console.log(JSON.stringify({ rendererV05: 'passed', roles: ['root', 'admin', 'user', 'shared'], checks: ['compact-layout', 'session-initialization', 'private-no-export', 'measured-latency', 'cloud-rename-note', 'revision-conflict-preserves-input', 'private-conversion', 'private-assignment', 'shared-creation', 'private-master-switch', 'shared-no-password', 'shared-local-only', 'cloud-failure-preserves-input', 'cloud-reload-sync', 'admin-cannot-create-admin', 'private-uri-single-and-valid', 'stale-grant-filter', 'legacy-no-auto-upload', 'empty-authorized-list', 'route-choice-confirmation', 'connected-route-switch', 'custom-proxy-port'], systemProxyModified: false }))
   } finally { await browser.close(); await new Promise(resolve => server.close(resolve)) }
 }
 run().catch(error => { console.error(error); process.exitCode = 1 })

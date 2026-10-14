@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('misaka',{
   clearSession:()=>ipcRenderer.invoke('account:clear-session'),
   getStatus:()=>ipcRenderer.invoke('core:get-status'),
   getLogs:()=>ipcRenderer.invoke('core:get-logs'),
+  setProxyPort:port=>ipcRenderer.invoke('core:set-port',port),
   validateNodes:text=>ipcRenderer.invoke('nodes:validate',text),
   testNode:payload=>ipcRenderer.invoke('nodes:test',payload),
   connect:payload=>ipcRenderer.invoke('core:connect',payload),
