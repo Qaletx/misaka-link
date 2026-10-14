@@ -12,7 +12,6 @@ permissions:
 env:
   VITE_API_URL: ${{ vars.MISAKA_API_URL }}
   QALETX_PRIVATE_NODE_URI: ${{ secrets.QALETX_PRIVATE_NODE_URI }}
-  npm_config_electron_mirror: https://npmmirror.com/mirrors/electron/
 
 jobs:
   build-macos:
@@ -23,7 +22,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - name: Install dependencies
         run: npm ci
@@ -43,9 +42,8 @@ jobs:
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: misaka-link-macos-universal
+          name: qaletx-link-macos-universal
           path: |
             release/*.dmg
             release/*.zip
           if-no-files-found: error
-

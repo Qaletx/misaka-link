@@ -1,0 +1,5 @@
+const fs=require('fs'),path=require('path'),{spawnSync}=require('child_process')
+const root=path.join(__dirname,'..')
+const files=fs.readdirSync(path.join(root,'tests')).filter(file=>file.endsWith('.test.cjs')).map(file=>path.join('tests',file))
+const result=spawnSync(process.execPath,['--test',...files],{cwd:root,stdio:'inherit'})
+process.exit(result.status??1)

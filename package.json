@@ -1,18 +1,20 @@
 {
   "name": "qaletx-link",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
-  "description": "A simple Hysteria2 desktop client with qaletx link account management.",
+  "description": "Simple multi-protocol desktop proxy client and Node.js account service",
   "main": "electron/main.cjs",
   "author": "qaletx link",
   "scripts": {
-    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron . --dev\"",
     "build": "node scripts/prepare-private-node.cjs && vite build",
     "preview": "vite preview",
     "start": "electron .",
     "server": "node server.js",
     "dist:win": "npm run build && electron-builder --win portable nsis --publish never",
-    "dist:mac": "npm run build && electron-builder --mac dmg --universal --publish never"
+    "dist:mac": "npm run build && electron-builder --mac dmg --universal --publish never",
+    "test": "node scripts/run-tests.cjs",
+    "test:electron": "node tests/electron-smoke.cjs"
   },
   "build": {
     "appId": "com.qaletx.link",
@@ -24,9 +26,22 @@
       "package.json"
     ],
     "extraResources": [
-      { "from": "core", "to": "core" },
-      { "from": "assets/qaletx-link.png", "to": "assets/qaletx-link.png" },
-      { "from": "assets/qaletx-link.ico", "to": "assets/qaletx-link.ico" }
+      {
+        "from": "assets/qaletx-link.png",
+        "to": "assets/qaletx-link.png"
+      },
+      {
+        "from": "assets/qaletx-link.ico",
+        "to": "assets/qaletx-link.ico"
+      },
+      {
+        "from": "licenses",
+        "to": "licenses"
+      },
+      {
+        "from": "THIRD_PARTY_NOTICES.md",
+        "to": "THIRD_PARTY_NOTICES.md"
+      }
     ],
     "directories": {
       "output": "release"
@@ -37,12 +52,22 @@
         "nsis"
       ],
       "artifactName": "qaletx-link-${version}-${arch}.${ext}",
-      "icon": "assets/qaletx-link.ico"
+      "icon": "assets/qaletx-link.ico",
+      "extraResources": [
+        {
+          "from": "core",
+          "to": "core",
+          "filter": [
+            "sing-box.exe"
+          ]
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,
       "perMachine": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "qaletx-link-${version}-setup-${arch}.${ext}"
     },
     "mac": {
       "target": [
@@ -50,7 +75,17 @@
       ],
       "category": "public.app-category.utilities",
       "artifactName": "qaletx-link-${version}-${arch}.${ext}",
-      "icon": "assets/qaletx-link.png"
+      "icon": "assets/qaletx-link.png",
+      "extraResources": [
+        {
+          "from": "core",
+          "to": "core",
+          "filter": [
+            "sing-box-amd64",
+            "sing-box-arm64"
+          ]
+        }
+      ]
     },
     "dmg": {
       "window": {
@@ -58,17 +93,23 @@
         "height": 340
       }
     },
-    "icon": "assets/qaletx-link.png"
+    "icon": "assets/qaletx-link.png",
+    "asarUnpack": [
+      "electron/windows-proxy.ps1"
+    ],
+    "portable": {
+      "artifactName": "qaletx-link-${version}-portable-${arch}.${ext}"
+    }
   },
   "devDependencies": {
     "@vitejs/plugin-react": "latest",
     "concurrently": "latest",
     "electron": "^22.3.27",
     "electron-builder": "latest",
+    "playwright-core": "1.62.0",
     "react": "latest",
     "react-dom": "latest",
     "vite": "latest",
     "wait-on": "latest"
   }
 }
-

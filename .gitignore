@@ -1,6 +1,9 @@
 node_modules/
 dist/
 release/
+release-final/
+test-artifacts/
+artifacts/
 server/data/users.json
 .env
 data/users.json
@@ -8,4 +11,3 @@ tmp-server-test/
 core/
 electron/private-node.cjs
 .DS_Store
-
