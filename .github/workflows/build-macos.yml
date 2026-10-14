@@ -1,0 +1,38 @@
+name: Build macOS universal app
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  VITE_API_URL: ${{ vars.MISAKA_API_URL }}
+  npm_config_electron_mirror: https://npmmirror.com/mirrors/electron/
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build universal DMG
+        run: npm run dist:mac
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: misaka-link-macos-universal
+          path: |
+            release/*.dmg
+            release/*.zip
+          if-no-files-found: error

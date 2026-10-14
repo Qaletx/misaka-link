@@ -1,0 +1,6 @@
+node_modules/
+dist/
+release/
+server/data/users.json
+core/
+.DS_Store

@@ -1,0 +1,65 @@
+{
+  "name": "misaka-link",
+  "version": "0.2.0",
+  "private": true,
+  "description": "A focused Hysteria2 desktop client for Windows 7+ and macOS.",
+  "main": "electron/main.cjs",
+  "author": "Misaka Link",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "electron .",
+    "server": "node server/index.cjs",
+    "dist:win": "npm run build && electron-builder --win portable nsis",
+    "dist:mac": "npm run build && electron-builder --mac dmg --universal"
+  },
+  "build": {
+    "appId": "com.misaka.link",
+    "productName": "Misaka Link",
+    "asar": true,
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        "portable",
+        "nsis"
+      ],
+      "artifactName": "Misaka-Link-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.utilities",
+      "artifactName": "Misaka-Link-${version}-${arch}.${ext}"
+    },
+    "dmg": {
+      "window": {
+        "width": 520,
+        "height": 340
+      }
+    }
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "latest",
+    "concurrently": "latest",
+    "electron": "^22.3.27",
+    "electron-builder": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "vite": "latest",
+    "wait-on": "latest"
+  }
+}
