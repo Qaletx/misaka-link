@@ -123,16 +123,27 @@ function Dashboard({ account, onLogout }) {
     } catch (error) { notify(error.message) } finally { setAdminBusy(false) }
   }
 
-  async function updateUserPassword() {
-    if (newUserPassword.length < 8) { notify('新密码至少需要 8 位'); return }
+  async function changePassword(username, password) {
+    if (password.length < 8) { notify('新密码至少需要 8 位'); return }
     setAdminBusy(true)
     try {
-      const response = await apiFetch('/api/users/user/password', { method: 'PATCH', token: account.token, body: { password: newUserPassword } })
+      const response = await apiFetch(`/api/users/${encodeURIComponent(username)}/password`, { method: 'PATCH', token: account.token, body: { password } })
       if (!response.ok) throw new Error(response.data?.error || '修改失败')
-      setNewUserPassword('')
-      notify('user 密码已更新')
+      notify(`${username} 密码已更新`)
       await openUsers()
     } catch (error) { notify(error.message) } finally { setAdminBusy(false) }
+  }
+
+  async function updateUserPassword() {
+    if (newUserPassword.length < 8) { notify('新密码至少需要 8 位'); return }
+    await changePassword('user', newUserPassword)
+    setNewUserPassword('')
+  }
+
+  async function promptPassword(username) {
+    const password = window.prompt(`为 ${username} 设置新密码（至少 8 位）`)
+    if (password === null) return
+    await changePassword(username, password)
   }
 
   async function toggleConnection() {
@@ -216,7 +227,7 @@ function Dashboard({ account, onLogout }) {
 
     {showImport && <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setShowImport(false)}><div className="modal"><div className="modal-head"><div><div className="eyebrow">ADD A ROUTE</div><h2>导入节点</h2></div><button className="close-button" onClick={() => setShowImport(false)}>×</button></div><p className="modal-copy">支持 Hysteria2、TUIC、VLESS、VMess、Trojan、Shadowsocks、SOCKS5 和 HTTP 分享链接。</p><textarea autoFocus placeholder="hysteria2://... 或 vless://..." value={importText} onChange={(e) => setImportText(e.target.value)}></textarea><div className="modal-example"><span>示例格式</span><code>vless://UUID@服务器:443?security=tls&amp;type=ws</code></div><div className="modal-actions"><button className="cancel-button" onClick={() => setShowImport(false)}>取消</button><button className="primary-button" onClick={importNode}><Icon name="upload" size={16}/>添加节点</button></div></div></div>}
     {showSettings && <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setShowSettings(false)}><div className="modal settings-modal"><div className="modal-head"><div><div className="eyebrow">CLIENT SETTINGS</div><h2>客户端设置</h2></div><button className="close-button" onClick={() => setShowSettings(false)}>×</button></div><p className="modal-copy">qaletx link 会在连接成功后接管系统代理，断开或退出时自动恢复原设置。</p><div className="settings-list"><div className="settings-item"><div><strong>系统代理</strong><span>127.0.0.1:10808 · 自动恢复</span></div><em className="settings-on">自动</em></div><div className="settings-item"><div><strong>节点列表</strong><span>导入的普通节点保存在本机</span></div><em className="settings-on">已启用</em></div><div className="settings-item"><div><strong>内置主节点</strong><span>由 qaletx link 主进程保护，不提供分享导出</span></div><em className="settings-lock"><Icon name="lock" size={13}/>私有</em></div><div className="settings-item"><div><strong>代理核心</strong><span>{appInfo.core ? `已就绪 · ${appInfo.coreName || 'sing-box'}` : '未检测到，请重新安装完整客户端'}</span></div><em className={appInfo.core ? 'settings-on' : 'settings-off'}>{appInfo.core ? '就绪' : '缺失'}</em></div></div><div className="modal-actions"><button className="cancel-button" onClick={() => setShowSettings(false)}>关闭</button><button className="primary-button" onClick={onLogout}>退出登录</button></div></div></div>}
-    {showUsers && <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setShowUsers(false)}><div className="modal admin-modal"><div className="modal-head"><div><div className="eyebrow">ROOT CONSOLE</div><h2>用户管理</h2></div><button className="close-button" onClick={() => setShowUsers(false)}>×</button></div><p className="modal-copy">root 可以管理普通用户。密码只在服务器端以加盐哈希保存。</p><div className="stats-strip"><div><strong>{stats.userCount || users.length}</strong><span>总账号</span></div><div><strong>{stats.activeSessions || 0}</strong><span>活跃会话</span></div><div><strong>H2</strong><span>节点协议</span></div></div><div className="user-list">{adminBusy && users.length === 0 ? <div className="admin-loading">正在读取账号…</div> : users.map((user) => <div className="user-row" key={user.username}><div><strong>{user.username}</strong><span>{user.role === 'root' ? '管理员' : '普通用户'}</span></div><div className="user-actions"><em>{user.username === 'root' ? '受保护' : '可管理'}</em>{user.username !== 'root' && <button className="danger-button" onClick={() => deleteUser(user.username)}>删除</button>}</div></div>)}</div><div className="password-editor"><label>修改 user 密码</label><div className="password-row"><input type="password" placeholder="至少 8 位" value={newUserPassword} onChange={(e) => setNewUserPassword(e.target.value)} /><button className="primary-button" onClick={updateUserPassword} disabled={adminBusy}>保存</button></div></div><div className="password-editor create-user"><label>创建普通用户</label><div className="password-row"><input placeholder="账号名" value={newUsername} onChange={(e) => setNewUsername(e.target.value)} /><input type="password" placeholder="初始密码" value={newAccountPassword} onChange={(e) => setNewAccountPassword(e.target.value)} /><button className="primary-button" onClick={createUser} disabled={adminBusy}>创建</button></div></div></div></div>}
+    {showUsers && <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setShowUsers(false)}><div className="modal admin-modal"><div className="modal-head"><div><div className="eyebrow">ROOT CONSOLE</div><h2>用户管理</h2></div><button className="close-button" onClick={() => setShowUsers(false)}>×</button></div><p className="modal-copy">root 可以管理普通用户。密码只在服务器端以加盐哈希保存。</p><div className="stats-strip"><div><strong>{stats.userCount || users.length}</strong><span>总账号</span></div><div><strong>{stats.activeSessions || 0}</strong><span>活跃会话</span></div><div><strong>H2</strong><span>节点协议</span></div></div><div className="user-list">{adminBusy && users.length === 0 ? <div className="admin-loading">正在读取账号…</div> : users.map((user) => <div className="user-row" key={user.username}><div><strong>{user.username}</strong><span>{user.role === 'root' ? '管理员' : '普通用户'}</span></div><div className="user-actions"><em>{user.username === 'root' ? '受保护' : '可管理'}</em>{user.username !== 'root' && <><button className="danger-button" onClick={() => promptPassword(user.username)}>改密码</button><button className="danger-button" onClick={() => deleteUser(user.username)}>删除</button></>}</div></div>)}</div><div className="password-editor"><label>修改 user 密码</label><div className="password-row"><input type="password" placeholder="至少 8 位" value={newUserPassword} onChange={(e) => setNewUserPassword(e.target.value)} /><button className="primary-button" onClick={updateUserPassword} disabled={adminBusy}>保存</button></div></div><div className="password-editor create-user"><label>创建普通用户</label><div className="password-row"><input placeholder="账号名" value={newUsername} onChange={(e) => setNewUsername(e.target.value)} /><input type="password" placeholder="初始密码" value={newAccountPassword} onChange={(e) => setNewAccountPassword(e.target.value)} /><button className="primary-button" onClick={createUser} disabled={adminBusy}>创建</button></div></div></div></div>}
     {notice && <div className="toast"><span className="status-pip"></span>{notice}</div>}
   </div>
 }
