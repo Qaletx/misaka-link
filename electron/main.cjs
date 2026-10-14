@@ -122,7 +122,17 @@ else {
     if(quitReady) return
     event.preventDefault(); if(quitting) return
     quitting=true
-    Promise.resolve(accountSession?.clearSession()).finally(()=>{quitReady=true;tray?.destroy();app.quit()})
+    if(tray){
+      tray.setToolTip('qaletx link · 正在安全退出')
+      tray.setContextMenu(Menu.buildFromTemplate([{label:'正在断开连接并恢复系统代理…',enabled:false}]))
+    }
+    Promise.resolve().then(()=>accountSession?.clearSession()).catch(()=>{
+      manager?.log('error','退出时未能完成代理清理，下次启动将重试恢复')
+    }).then(()=>{
+      quitReady=true
+      try {tray?.destroy()} catch {}
+      app.quit()
+    })
   })
   app.on('window-all-closed',()=>{if(!tray&&!quitting) app.quit()})
 }

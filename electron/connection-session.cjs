@@ -39,6 +39,12 @@ class ConnectionSession {
       const stopped=await this.manager.disconnect()
       if(!current())return cancelled()
       if(!stopped.ok)return stopped
+      if(this.manager.checkPort){
+        const available=await this.manager.checkPort()
+        if(!current())return cancelled()
+        if(!available.ok){this.manager.update({phase:'error',stage:'',error:available.message});return available}
+      }
+      this.manager.update({phase:'connecting',stage:'正在确认线路权限',error:''})
       const node=await this.account.resolve(payload)
       if(!current())return cancelled()
       const result=await this.manager.connect({...node,mode:payload.mode||'global'})
@@ -49,7 +55,11 @@ class ConnectionSession {
         clearInterval(this.timer);this.timer=setInterval(()=>this.checkAccess(),this.interval)
       }
       return result
-    }catch(error){return current()?{ok:false,message:error.message}:cancelled()}
+    }catch(error){
+      if(!current())return cancelled()
+      this.manager.update({phase:'error',stage:'',error:error.message})
+      return {ok:false,message:error.message}
+    }
   }
   disconnect(){++this.connectionEpoch;this.stopWatch();return this.manager.disconnect()}
   async testNode(payload) {

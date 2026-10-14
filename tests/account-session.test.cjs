@@ -67,6 +67,19 @@ test('an unauthorized probe never reaches the core and never interrupts the acti
   assert.equal(result.ok,false);assert.equal(probes,0);assert.equal(manager.stops,stops)
   await session.clearSession()
 })
+
+test('an occupied proxy port is reported before requesting private node credentials',async()=>{
+  const manager=managerStub();let authorizations=0
+  manager.checkPort=async()=>({ok:false,message:'本地代理端口 10808 已被占用'})
+  const account={clear(){},async set(){return user('user')},async resolve(){authorizations++;throw new Error('should not request configuration')}}
+  const session=new ConnectionSession({manager,account,createProbe:()=>({close:async()=>{}})})
+  await session.setSession({})
+  const result=await session.connect({nodeId:'mine'})
+  assert.equal(result.ok,false);assert.match(result.message,/10808/)
+  assert.equal(authorizations,0);assert.equal(manager.starts,0)
+  assert.equal(manager.status().phase,'error')
+  await session.clearSession()
+})
 test('revocation and configuration changes disconnect an active cloud node',async()=>{
   const manager=managerStub();let allowed=true,uri='socks5://127.0.0.1:3333'
   const account={clear(){},async set(){return user('user')},async resolve(){if(!allowed){const e=new Error('denied');e.status=403;throw e}return{uri,id:'mine',nodeId:'mine',name:'Mine'}}}

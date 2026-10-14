@@ -1,6 +1,6 @@
 {
   "name": "qaletx-link",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "description": "Simple multi-protocol desktop proxy client and Node.js account service",
   "main": "electron/main.cjs",

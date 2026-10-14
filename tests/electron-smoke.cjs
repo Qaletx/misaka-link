@@ -3,6 +3,7 @@
 const { _electron: electron } = require('playwright-core')
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path')
 const net = require('node:net'), crypto = require('node:crypto')
+const http = require('node:http')
 const { spawn } = require('node:child_process')
 const assert = require('node:assert/strict')
 const { SystemProxy } = require('../electron/system-proxy.cjs')
@@ -151,7 +152,33 @@ async function run() {
     await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].show())
     assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isVisible()), true)
     assert.deepEqual(errors, [])
-    await app.close(); app = null
+    // The tray's Exit action calls app.quit(). Verify that an in-flight
+    // account request cannot keep that cleanup path open indefinitely.
+    let pendingRequest = false
+    const slowApi = http.createServer(() => { pendingRequest = true })
+    await new Promise(resolve => slowApi.listen(0, '127.0.0.1', resolve))
+    const slowUrl = `http://127.0.0.1:${slowApi.address().port}`
+    try {
+      const pending = page.evaluate(apiUrl => window.misaka.setSession({ apiUrl, token: 'isolated-quit-test' }), slowUrl).catch(() => {})
+      for (let attempt = 0; attempt < 100 && !pendingRequest; attempt++) await pause(20)
+      assert.equal(pendingRequest, true, 'Exit fixture did not begin account authorization')
+      const mainPid = await app.evaluate(() => process.pid)
+      const started = Date.now()
+      await app.evaluate(({ app }) => app.quit()).catch(() => {})
+      let exited = false
+      for (let attempt = 0; attempt < 20; attempt++) {
+        try { process.kill(mainPid, 0) }
+        catch (error) { if (error.code === 'ESRCH') { exited = true; break } }
+        await pause(100)
+      }
+      assert.ok(exited, 'Tray-equivalent Exit must finish while account authorization is pending')
+      assert.ok(Date.now() - started < 3000, 'Exit must not wait for the account request timeout')
+      await pending
+      app = null
+    } finally {
+      slowApi.closeAllConnections()
+      await new Promise(resolve => slowApi.close(resolve))
+    }
     assert.ok(JSON.stringify(await proxy.snapshot()) === JSON.stringify(before), 'Exiting the test app must not change the original proxy')
     assert.equal(fs.existsSync(path.join(profile, 'proxy-recovery.json')), false)
     report = { electronSmoke: 'passed', version: info.version, packaged: Boolean(packed), tray: info.tray, loginInputs: fields, layout: size, backend: 'isolated real server', privateMetadataHidden: true, realLatencyMs: probe.latencyMs, occupiedPortRejected, systemProxy: 'unchanged' }

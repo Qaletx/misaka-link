@@ -41,8 +41,8 @@ async function run() {
         getInfo: async () => ({ version: '0.5.0', core: true, coreName: 'sing-box', platform: 'win32' }),
         getStatus: async () => ({ phase: 'idle', connected: false, port: 10808 }),
         onStatus: () => () => {}, getLogs: async () => [],
-        connect: async value => { window.__ipc.push({ op: 'connect', value }); return { ok: true } },
-        disconnect: async () => ({ ok: true }),
+        connect: async value => { window.__ipc.push({ op: 'connect', value }); if (window.__holdConnect) await new Promise(resolve => { window.__releaseConnect = resolve }); return { ok: true } },
+        disconnect: async () => { window.__ipc.push({ op: 'disconnect' }); window.__holdConnect = false; window.__releaseConnect?.(); return { ok: true } },
         testNode: async value => { window.__ipc.push({ op: 'testNode', value }); await new Promise(resolve => setTimeout(resolve, 20)); return { ok: true, latencyMs: 42, checkedAt: Date.now() } },
         validateNodes: async value => ({ nodes: value.split('\n').filter(line => /^socks5:\/\//.test(line)).map(uri => ({ uri, name: decodeURIComponent(uri.split('#')[1] || 'Imported'), protocol: 'SOCKS5' })), errors: [] })
       }
@@ -87,6 +87,14 @@ async function run() {
     assert.ok(layout.height <= layout.viewport + 1)
     assert.equal((await page.evaluate(() => window.__ipc))[0].op, 'setSession')
     await page.screenshot({ path: path.join(output, 'v05-dashboard.png') })
+    await page.evaluate(() => { window.__holdConnect = true })
+    await page.getByRole('button', { name: '一键连接', exact: true }).click()
+    const cancel = page.getByRole('button', { name: '取消连接', exact: true })
+    await cancel.waitFor(); assert.equal(await cancel.isEnabled(), true)
+    await cancel.click()
+    await page.getByRole('button', { name: '一键连接', exact: true }).waitFor()
+    assert.ok((await page.evaluate(() => window.__ipc)).some(item => item.op === 'disconnect'))
+    assert.equal(await page.getByText('连接已建立', { exact: true }).count(), 0)
     await page.getByRole('button', { name: '我的线路', exact: false }).click()
     const dialog = page.getByRole('dialog')
     const privateRow = dialog.locator('.node-card').filter({ hasText: '专属主线路' })

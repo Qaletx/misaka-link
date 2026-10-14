@@ -69,8 +69,8 @@ class CoreManager extends EventEmitter {
     this.proxyPort=options.proxyPort===undefined?10808:options.proxyPort
     if(!Number.isInteger(this.proxyPort)||this.proxyPort<1||this.proxyPort>65535) throw new Error('本地代理端口必须为 1–65535 之间的整数')
     this.probeUrls=options.probeUrls||['https://www.gstatic.com/generate_204','https://www.apple.com/library/test/success.html']
-    this.queue=Promise.resolve(); this.child=null; this.logs=[]; this.timer=null; this.guardian=null; this.cancel=false; this.cancelEpoch=0
-    this.state={phase:'idle',connected:false,nodeId:null,name:'',startedAt:null,up:0,down:0,error:'',systemProxy:false,mode:'global',port:this.proxyPort}
+    this.queue=Promise.resolve(); this.child=null; this.logs=[]; this.timer=null; this.guardian=null; this.cancel=false; this.cancelEpoch=0; this.connectionAbort=null
+    this.state={phase:'idle',stage:'',connected:false,nodeId:null,name:'',startedAt:null,up:0,down:0,error:'',systemProxy:false,mode:'global',port:this.proxyPort}
   }
   status() { return {...this.state} }
   update(patch) { Object.assign(this.state,patch); this.emit('status',this.status()) }
@@ -80,7 +80,11 @@ class CoreManager extends EventEmitter {
     const epoch=this.cancelEpoch
     return this.serial(()=>this.start(payload,epoch))
   }
-  disconnect() { this.cancel=true; this.cancelEpoch++; return this.serial(()=>this.stop()) }
+  disconnect() { this.cancel=true; this.cancelEpoch++; this.connectionAbort?.abort(); return this.serial(()=>this.stop()) }
+  async checkPort() {
+    try { const release=await reservePort(this.proxyPort); await release(); return {ok:true} }
+    catch(error) { return {ok:false,message:error.message} }
+  }
   alive() {
     if(this.cancel) throw new Error('连接已取消')
     if(!this.child || this.child.exitCode!==null || this.child.signalCode!==null || this.spawnFailed) throw new Error('代理核心启动失败或已退出')
@@ -91,8 +95,9 @@ class CoreManager extends EventEmitter {
     // cancellation, nor replace a core while its system proxy cannot be restored.
     if(!previous.ok) return previous
     if(epoch!==this.cancelEpoch) return {ok:false,message:'连接已取消'}
+    const abort=new AbortController(); this.connectionAbort=abort
     this.cancel=false
-    this.update({phase:'connecting',connected:false,error:'',nodeId:payload.id||payload.privateId||null,name:payload.name||'节点',up:0,down:0,startedAt:null,mode:payload.mode||'global'})
+    this.update({phase:'connecting',stage:'正在校验线路',connected:false,error:'',nodeId:payload.id||payload.privateId||null,name:payload.name||'节点',up:0,down:0,startedAt:null,mode:payload.mode||'global'})
     let configPath,releasePort
     try {
       if(!this.binary || !fs.existsSync(this.binary)) throw new Error('安装包缺少代理核心，请重新安装完整版本')
@@ -106,11 +111,12 @@ class CoreManager extends EventEmitter {
       fs.mkdirSync(this.directory,{recursive:true})
       configPath=path.join(this.directory,`session-${crypto.randomBytes(8).toString('hex')}.json`)
       fs.writeFileSync(configPath,config,{mode:0o600})
-      try { await execute(this.binary,['check','-c',configPath],{windowsHide:true,timeout:8000,maxBuffer:65536}) }
-      catch { throw new Error('节点配置未通过核心校验，请检查协议和链接参数') }
+      try { await execute(this.binary,['check','-c',configPath],{windowsHide:true,timeout:8000,maxBuffer:65536,signal:abort.signal}) }
+      catch { throw new Error(abort.signal.aborted?'连接已取消':'节点配置未通过核心校验，请检查协议和链接参数') }
       if(this.cancel) throw new Error('连接已取消')
       this.spawnFailed=false
       await releasePort(); releasePort=null
+      this.update({stage:'正在启动代理核心'})
       const child=spawn(this.binary,['run','-c',configPath],{windowsHide:true,stdio:['ignore','ignore','pipe']})
       this.child=child
       // Do not forward raw core errors: they can contain node addresses and credentials.
@@ -130,29 +136,31 @@ class CoreManager extends EventEmitter {
       let ready=false
       while(Date.now()<deadline) {
         this.alive()
-        try { await controller(apiPort,secret,'/version',600); ready=true; break } catch { await pause(150) }
+        try { await controller(apiPort,secret,'/version',600,abort.signal); ready=true; break } catch { if(abort.signal.aborted) throw new Error('连接已取消'); await pause(150) }
       }
       if(!ready) throw new Error('代理核心未能就绪，请重试')
       // A listening port does not prove the upstream node works. Test through the outbound.
+      this.update({stage:'正在测试线路连通性'})
       let reachable=false
       for(const url of this.probeUrls) {
         this.alive()
         try {
           if(url.startsWith('http://')) {
             if((payload.mode||'global')!=='global') throw new Error('HTTP 探测仅适用于全局模式')
-            await httpProbe(port,url)
+            await httpProbe(port,url,5000,abort.signal)
             reachable=true; break
           } else {
-            const result=await controller(apiPort,secret,`/proxies/proxy/delay?url=${encodeURIComponent(url)}&timeout=7000`,8000)
+            const result=await controller(apiPort,secret,`/proxies/proxy/delay?url=${encodeURIComponent(url)}&timeout=5000`,5500,abort.signal)
             if(Number.isFinite(result.delay) && result.delay>=0) { reachable=true; break }
           }
-        } catch {}
+        } catch { if(abort.signal.aborted) throw new Error('连接已取消') }
       }
       this.alive()
       if(!reachable) throw new Error('节点连通性检测失败，请检查网络或更换节点后重试')
+      this.update({stage:'正在设置系统代理'})
       await this.proxy.enable(port)
       this.alive()
-      this.update({phase:'connected',connected:true,systemProxy:true,startedAt:Date.now(),error:''})
+      this.update({phase:'connected',stage:'',connected:true,systemProxy:true,startedAt:Date.now(),error:''})
       this.log('info','节点连通性检测通过，系统代理已开启')
       let polling=false,failures=0
       this.timer=setInterval(async()=>{
@@ -174,12 +182,13 @@ class CoreManager extends EventEmitter {
     } catch(error) {
       const message=error.message||'连接失败'
       const stopped=await this.stop(false)
-      this.update({phase:'error',error:stopped.ok?message:`${message}；${stopped.message}`})
+      this.update({phase:'error',stage:'',error:stopped.ok?message:`${message}；${stopped.message}`})
       this.log('error',this.state.error)
       return {ok:false,message:this.state.error}
     } finally {
       if(releasePort) await releasePort()
       if(configPath) try { fs.unlinkSync(configPath) } catch {}
+      if(this.connectionAbort===abort) this.connectionAbort=null
     }
   }
   async stop(publish=true) {
@@ -196,7 +205,7 @@ class CoreManager extends EventEmitter {
       })
     }
     if(this.guardian && !restoreError) { try{this.guardian.kill()}catch{}; this.guardian=null }
-    this.update({phase:restoreError?'error':'idle',connected:false,systemProxy:Boolean(restoreError),startedAt:null,error:restoreError})
+    this.update({phase:restoreError?'error':'idle',stage:'',connected:false,systemProxy:Boolean(restoreError),startedAt:null,error:restoreError})
     if(publish) this.log(restoreError?'error':'info',restoreError||'已断开，系统代理已恢复')
     return {ok:!restoreError,message:restoreError||'已断开连接'}
   }

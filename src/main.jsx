@@ -86,6 +86,7 @@ function Dashboard({ account, onLogout }) {
   const [selected, setSelected] = useState('')
   const [status, setStatus] = useState(INITIAL_STATUS)
   const [operation, setOperation] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
   const [now, setNow] = useState(Date.now())
   const [info, setInfo] = useState({ core: false, platform: 'unknown' })
   const [panel, setPanel] = useState(null)
@@ -118,12 +119,14 @@ function Dashboard({ account, onLogout }) {
   const refreshId = useRef(0)
   const mutation = useRef(false)
   const testsInFlight = useRef(new Set())
+  const connectAttempt = useRef(0)
   const noticeTimer = useRef(null)
   panelRef.current = panel
   const activeNode = useMemo(() => nodes.find((node) => node.id === selected) || nodes[0], [nodes, selected])
   const privateNodes = cloudNodes.filter((node) => node.private)
   const connected = Boolean(status.connected)
   const busy = operation || status.phase === 'connecting' || status.phase === 'disconnecting'
+  const canCancel = !connected && busy && !cancelling && status.phase !== 'disconnecting'
   const notify = useCallback((message, type = 'success') => {
     clearTimeout(noticeTimer.current); setNotice({ message, type }); noticeTimer.current = setTimeout(() => setNotice(null), 5200)
   }, [])
@@ -170,17 +173,31 @@ function Dashboard({ account, onLogout }) {
   async function toggleConnection() {
     if (busy) return
     if (!window.misaka?.connect) { notify('请在已安装的桌面客户端中连接', 'error'); return }
+    const attempt = ++connectAttempt.current
     setOperation(true)
     try {
       if (connected) { const result = await window.misaka.disconnect(); if (result?.ok === false) throw new Error(result.message || '断开失败，请重试'); await syncStatus(); notify('已断开，系统代理已恢复') }
       else {
         if (!activeNode) throw new Error('请先导入线路，或请管理员分配私有线路')
         const result = await window.misaka.connect({ ...coreNode(activeNode), name: activeNode.name, mode: routeMode })
+        if (attempt !== connectAttempt.current) return
         if (!result?.ok) throw new Error(result?.message || '连接未能建立，请查看诊断日志')
         await syncStatus(); notify('连接已建立')
       }
-    } catch (error) { notify(error.message || '连接操作失败', 'error'); await syncStatus().catch(() => {}) }
-    finally { setOperation(false) }
+    } catch (error) { if (attempt === connectAttempt.current) { notify(error.message || '连接操作失败', 'error'); await syncStatus().catch(() => {}) } }
+    finally { if (attempt === connectAttempt.current) setOperation(false) }
+  }
+  async function cancelConnection() {
+    if (cancelling) return
+    ++connectAttempt.current
+    setCancelling(true)
+    try {
+      const result = await window.misaka.disconnect()
+      if (result?.ok === false) throw new Error(result.message || '取消连接失败')
+      await syncStatus()
+      notify('连接已取消')
+    } catch (error) { notify(error.message || '取消连接失败', 'error'); await syncStatus().catch(() => {}) }
+    finally { setCancelling(false); setOperation(false) }
   }
   async function testNode(node) {
     if (testsInFlight.current.has(node.id)) return
@@ -350,7 +367,7 @@ function Dashboard({ account, onLogout }) {
   return <div className="app-shell">
     <aside className="sidebar"><Brand/><span className="side-caption">你的工作区</span><nav className="nav-list" aria-label="主导航"><button className={`nav-item ${!panel ? 'active' : ''}`} onClick={() => setPanel(null)}><Icon name="power"/><span>连接中心</span><i/></button><button className={`nav-item ${panel === 'nodes' || panel === 'import' ? 'active' : ''}`} onClick={() => setPanel('nodes')}><Icon name="globe"/><span>我的线路</span><small>{nodes.length}</small></button><button className={`nav-item ${panel === 'settings' ? 'active' : ''}`} onClick={() => setPanel('settings')}><Icon name="settings"/><span>偏好设置</span></button><button className={`nav-item ${panel === 'logs' ? 'active' : ''}`} onClick={() => setPanel('logs')}><Icon name="log"/><span>诊断日志</span></button>{canManage && <><span className="side-caption admin-caption">管理工作区</span><button className={`nav-item ${panel === 'users' ? 'active' : ''}`} onClick={openUsers}><Icon name="users"/><span>用户管理</span><small>{root ? 'ROOT' : 'ADMIN'}</small></button></>}</nav><div className="sidebar-bottom"><div className="version-card"><span className={`status-dot ${info.core ? 'green' : ''}`}/><div><strong>{info.core ? '代理核心就绪' : '等待核心'}</strong><small>{info.version ? `v${info.version}` : 'qaletx link'} · {info.platform === 'darwin' ? 'macOS' : info.platform === 'win32' ? 'Windows' : '桌面客户端'}</small></div></div><button className="sidebar-account" onClick={() => setPanel('account')}><span className="avatar">{account.username?.slice(0, 1).toUpperCase()}</span><span><strong>{account.username}</strong><small>{roleName(account)}</small></span><Icon name="chevron" size={14}/></button></div></aside>
     <main className="main-panel"><header className="topbar"><div><span className="eyebrow">A QUIETER WAY TO CONNECT</span><h1>连接，简单一点<span>。</span></h1></div><div className="topbar-right"><span className="status-chip"><i className={`status-dot ${connected ? 'green' : ''}`}/>{PHASE_NAMES[status.phase] || '尚未连接'}</span><button className="icon-button" aria-label="偏好设置" onClick={() => setPanel('settings')}><Icon name="settings"/></button></div></header>
-      <div className="dashboard-grid"><section className={`connection-card ${connected ? 'is-connected' : ''} ${busy ? 'is-working' : ''}`} aria-label="连接控制"><div className="connection-art" aria-hidden="true"><i/><i/><i/><b/></div><div className="connection-copy"><span className="connection-label"><i/>{connected ? 'CONNECTED' : busy ? 'CONNECTING' : 'READY WHEN YOU ARE'}</span><h2>{connected ? <>世界，近在眼前。</> : <>你的世界，<br/>一键连通。</>}</h2><p>{status.phase === 'error' ? '连接遇到了问题，可以重试或查看诊断。' : connected ? '系统代理已接管，安心继续你的工作。' : nodeAvailable ? '已为你选好线路，点击连接即可开始。' : '导入线路或联系管理员，即可开始连接。'}</p><button className={`connect-button ${connected ? 'disconnect' : ''}`} disabled={busy || (!connected && !nodeAvailable)} onClick={toggleConnection}>{busy ? <span className="spinner"/> : <Icon name="power" size={17}/>}<span>{status.phase === 'disconnecting' ? '正在断开' : busy ? '正在连接' : connected ? '断开连接' : '一键连接'}</span><Icon name="arrow" size={17}/></button></div><div className="connection-footer"><span><Icon name="globe" size={13}/>{MODE_NAMES[currentMode]}</span><span>{activeNode?.protocol || '选择线路'}</span></div></section>
+      <div className="dashboard-grid"><section className={`connection-card ${connected ? 'is-connected' : ''} ${busy ? 'is-working' : ''}`} aria-label="连接控制"><div className="connection-art" aria-hidden="true"><i/><i/><i/><b/></div><div className="connection-copy"><span className="connection-label"><i/>{connected ? 'CONNECTED' : busy ? 'CONNECTING' : 'READY WHEN YOU ARE'}</span><h2>{connected ? <>世界，近在眼前。</> : <>你的世界，<br/>一键连通。</>}</h2><p>{status.phase === 'connecting' ? (status.stage || '正在准备连接，可以随时取消。') : status.phase === 'error' ? '连接遇到了问题，可以重试或查看诊断。' : connected ? '系统代理已接管，安心继续你的工作。' : nodeAvailable ? '已为你选好线路，点击连接即可开始。' : '导入线路或联系管理员，即可开始连接。'}</p><button className={`connect-button ${connected || canCancel ? 'disconnect' : ''}`} disabled={cancelling || status.phase === 'disconnecting' || (!connected && !nodeAvailable && !busy)} onClick={canCancel ? cancelConnection : toggleConnection}>{busy && !canCancel ? <span className="spinner"/> : <Icon name="power" size={17}/>}<span>{status.phase === 'disconnecting' || cancelling ? '正在取消' : canCancel ? '取消连接' : connected ? '断开连接' : '一键连接'}</span><Icon name="arrow" size={17}/></button></div><div className="connection-footer"><span><Icon name="globe" size={13}/>{MODE_NAMES[currentMode]}</span><span>{activeNode?.protocol || '选择线路'}</span></div></section>
       <section className="session-panel" aria-label="本次连接状态"><div className="panel-caption"><span className="eyebrow">THIS SESSION</span><Icon name="clock" size={16}/></div><div className="session-clock"><strong>{sessionTime}</strong><span>{connected ? '本次连接时长' : '连接后开始计时'}</span></div><div className="traffic-grid"><div><span><Icon name="down" size={13}/>下载</span><strong>{formatBytes(status.down)}</strong></div><div><span><Icon name="up" size={13}/>上传</span><strong>{formatBytes(status.up)}</strong></div></div><div className="proxy-status"><span className={`status-dot ${status.systemProxy ? 'green' : ''}`}/>{status.systemProxy ? '系统代理已开启' : '系统代理未接管'}<button aria-label="查看连接诊断" onClick={() => setPanel('logs')}><Icon name="chevron" size={13}/></button></div></section>
       <section className="nodes-panel"><div className="section-head"><div><span className="eyebrow">YOUR CONNECTIONS</span><h2>可用线路 <span>{nodes.length}</span></h2></div><button className="text-button" onClick={() => setPanel('nodes')}>管理线路<Icon name="chevron" size={14}/></button></div><div className="nodes-preview">{nodeRow(activeNode)}</div><div className="nodes-bottom"><span><Icon name="lock" size={12}/>{activeNode?.private ? '私有线路由管理员分配，不提供分享导出。' : shared ? '共用账号的个人线路仅保存在本机。' : '个人线路与账号同步，换台电脑也能继续。'}</span><button className="text-button" onClick={() => setPanel('nodes')}>切换线路<Icon name="refresh" size={13}/></button></div></section>
       {(status.error || !nodeAvailable) && <div className="inline-error" role="status"><span>{!nodeAvailable ? syncState.error || '暂无线路，请导入或联系管理员分配。' : status.error}</span><button className="text-button" onClick={() => setPanel('logs')}>查看诊断</button></div>}

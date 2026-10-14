@@ -263,6 +263,24 @@ test('disconnect during an in-flight probe cancels connection without enabling p
   } finally { await context.cleanup(); await network.close() }
 })
 
+test('disconnect aborts a stalled network probe without waiting for its timeout', { skip: !hasCore }, async () => {
+  const network = await localNetwork({ holdProbe: true })
+  const context = await instance({ probeUrls: [network.probeUrl] })
+  try {
+    const connecting = context.manager.connect({ uri: network.uri })
+    await until(() => network.state.probes === 1)
+    const started = Date.now()
+    const disconnecting = context.manager.disconnect()
+    const [connection, stopped] = await Promise.all([connecting, disconnecting])
+    assert.equal(connection.ok, false)
+    assert.match(connection.message, /取消/)
+    assert.equal(stopped.ok, true)
+    assert.ok(Date.now() - started < 2000, 'Cancelling must not wait for a network timeout')
+    assert.deepEqual(context.proxy.enabledPorts, [])
+    assert.equal(context.manager.status().phase, 'idle')
+  } finally { await context.cleanup(); await network.close() }
+})
+
 test('disconnect cancels both the active request and all older queued connects', { skip: !hasCore }, async () => {
   const network = await localNetwork({ holdProbe: true })
   const context = await instance({ probeUrls: [network.probeUrl] })
