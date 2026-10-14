@@ -7,10 +7,10 @@
   "author": "qaletx link",
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
-    "build": "vite build",
+    "build": "node scripts/prepare-private-node.cjs && vite build",
     "preview": "vite preview",
     "start": "electron .",
-    "server": "node server/index.cjs",
+    "server": "node server.js",
     "dist:win": "npm run build && electron-builder --win portable nsis --publish never",
     "dist:mac": "npm run build && electron-builder --mac dmg --universal --publish never"
   },
@@ -22,6 +22,11 @@
       "dist/**/*",
       "electron/**/*",
       "package.json"
+    ],
+    "extraResources": [
+      { "from": "core", "to": "core" },
+      { "from": "assets/qaletx-link.png", "to": "assets/qaletx-link.png" },
+      { "from": "assets/qaletx-link.ico", "to": "assets/qaletx-link.ico" }
     ],
     "directories": {
       "output": "release"
@@ -66,3 +71,4 @@
     "wait-on": "latest"
   }
 }
+

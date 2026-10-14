@@ -4,5 +4,6 @@ contextBridge.exposeInMainWorld('misaka', {
   connect: (payload) => ipcRenderer.invoke('core:connect', payload),
   disconnect: () => ipcRenderer.invoke('core:disconnect'),
   openExternal: (url) => ipcRenderer.invoke('shell:open-external', url),
-  onCoreExit: (callback) => ipcRenderer.on('core:exit', callback)
+  onCoreExit: (callback) => { const listener = (_event, ...args) => callback(...args); ipcRenderer.on('core:exit', listener); return () => ipcRenderer.removeListener('core:exit', listener) }
 })
+

@@ -1,6 +1,6 @@
 # qaletx link 服务端：宝塔 PM2 部署
 
-服务端是 **Node.js CommonJS 服务**，入口文件是 `server/index.cjs`，不是 PHP，也不是 Electron。宝塔里推荐使用 Node.js 20 LTS（Node 18+ 也可以）。服务端只依赖 Node 内置模块，不需要安装 Express、数据库或其他运行库。
+服务端是 **Node.js CommonJS 服务**，极简入口文件是项目根目录的 `server.js`，不是 PHP，也不是 Electron。宝塔里推荐使用 Node.js 20 LTS（Node 18+ 也可以）。服务端只依赖 Node 内置模块，不需要安装 Express、数据库或其他运行库。
 
 ## 1. 准备项目目录
 
@@ -10,15 +10,14 @@
 /www/wwwroot/qaletx-link
 ```
 
-如果只部署服务端，至少上传：
+如果只部署极简服务端，只需上传：
 
 ```text
-server/index.cjs
-server/data/
-package.json
+server.js
+.env
 ```
 
-首次启动会自动创建 `server/data/users.json`，里面保存的是加盐后的密码哈希。
+`.env` 可由项目中的 `.env.example` 复制，首次启动会自动创建 `data/users.json`，里面保存的是加盐后的密码哈希。
 
 ## 2. 在宝塔安装 Node.js
 
@@ -34,8 +33,8 @@ npm -v
 打开「软件商店 → PM2 管理器 → 添加项目」，填写：
 
 - 项目名称：`qaletx-link-server`
-- 启动文件：`server/index.cjs`
-- 项目目录：`/www/wwwroot/qaletx-link`
+- 启动文件：`server.js`
+- 项目目录：存放 `server.js` 和 `.env` 的目录
 - 运行端口：`8787`
 - Node 版本：`20`
 
@@ -47,6 +46,7 @@ MISAKA_PORT=8787
 MISAKA_TOKEN_SECRET=请替换为随机长字符串
 MISAKA_USER_PASSWORD=你提供的user初始密码
 MISAKA_ROOT_PASSWORD=你提供的root初始密码
+MISAKA_CORS_ORIGIN=*
 ```
 
 不要把真实密码写进 GitHub 仓库或截图。保存后启动项目。
@@ -65,7 +65,7 @@ curl http://127.0.0.1:8787/api/health
 pm2 logs qaletx-link-server
 ```
 
-如果外部客户端直接连接 `http://服务器IP:8787`，需要在宝塔「安全」和云服务器安全组放行 TCP 8787。
+如果外部客户端直接连接 `http://服务器IP:8787`，需要在宝塔「安全」和云服务器安全组放行 TCP 8787。正式环境建议使用下方的 HTTPS 反向代理，并把 `MISAKA_CORS_ORIGIN` 改成客户端页面所在域名。
 
 ## 5. 推荐的正式配置：反向代理 + HTTPS
 
@@ -86,4 +86,5 @@ https://link-api.example.com
 ## 6. 修改初始密码
 
 首次启动完成后，root 登录客户端的「用户管理」即可创建普通用户、删除普通用户、修改 `user` 密码。服务器端的 `server/data/users.json` 要保留，删除它会重新按环境变量创建初始账号。
+
 

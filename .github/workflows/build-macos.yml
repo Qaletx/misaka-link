@@ -3,14 +3,15 @@ name: Build macOS universal app
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
 
 env:
   VITE_API_URL: ${{ vars.MISAKA_API_URL }}
+  QALETX_PRIVATE_NODE_URI: ${{ secrets.QALETX_PRIVATE_NODE_URI }}
   npm_config_electron_mirror: https://npmmirror.com/mirrors/electron/
 
 jobs:
@@ -26,6 +27,17 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Download sing-box cores
+        shell: bash
+        run: |
+          mkdir -p core
+          curl -L --fail -o /tmp/sing-box-amd64.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-darwin-amd64-legacy-macos-10.13.tar.gz
+          tar -xzf /tmp/sing-box-amd64.tar.gz -C /tmp
+          find /tmp -path '*darwin-amd64*/sing-box' -type f -exec cp {} core/sing-box-amd64 \; -quit
+          curl -L --fail -o /tmp/sing-box-arm64.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-darwin-arm64.tar.gz
+          tar -xzf /tmp/sing-box-arm64.tar.gz -C /tmp
+          find /tmp -path '*darwin-arm64*/sing-box' -type f -exec cp {} core/sing-box-arm64 \; -quit
+          chmod +x core/sing-box-amd64 core/sing-box-arm64
       - name: Build universal DMG
         run: npm run dist:mac
       - name: Upload macOS artifacts
@@ -36,3 +48,4 @@ jobs:
             release/*.dmg
             release/*.zip
           if-no-files-found: error
+
