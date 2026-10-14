@@ -22,6 +22,11 @@ function locateCore() {
 function showWindow() { if(!mainWindow||mainWindow.isDestroyed()) createWindow(); if(mainWindow.isMinimized()) mainWindow.restore(); mainWindow.show(); mainWindow.focus() }
 function updateTray() {
   if(!tray || !manager) return
+  if(quitting) {
+    tray.setToolTip('qaletx link · 正在安全退出')
+    tray.setContextMenu(Menu.buildFromTemplate([{label:'正在断开连接并恢复系统代理…',enabled:false}]))
+    return
+  }
   const state=manager.status()
   tray.setToolTip(`qaletx link · ${state.connected?'已连接':'未连接'}`)
   tray.setContextMenu(Menu.buildFromTemplate([
