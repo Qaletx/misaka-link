@@ -6,7 +6,7 @@ const defaultUri = 'hysteria2://82409cf6@147.189.161.140:14647?sni=www.bing.com&
 const DEFAULT_API_URL = import.meta.env.VITE_API_URL || 'http://147.189.161.140:8787'
 
 const initialNodes = [
-  { id: 'misaka', name: 'Misaka · 主节点', region: '美国 / 纽约', latency: 128, status: 'online', uri: defaultUri, emoji: '◎', note: '默认节点' },
+  { id: 'misaka', name: 'qaletx · 主节点', region: '美国 / 纽约', latency: 128, status: 'online', uri: defaultUri, emoji: '◎', note: '默认节点' },
   { id: 'backup', name: '备用节点', region: '未导入', latency: null, status: 'idle', uri: '', emoji: '＋', note: '等待导入' }
 ]
 
@@ -138,7 +138,7 @@ function Dashboard({ account, onLogout }) {
 
   return <div className="app-shell">
     <aside className="sidebar">
-      <div className="brand"><div className="brand-mark"><span></span><span></span><span></span></div><div><div className="brand-name">MISAKA</div><div className="brand-sub">LINK / CLIENT</div></div></div>
+      <div className="brand"><img className="brand-icon" src="./qaletx-link.svg" alt="qaletx link" /><div><div className="brand-name">qaletx link</div><div className="brand-sub">PRIVATE ACCESS</div></div></div>
       <div className="side-caption">工作区</div>
       <nav className="nav-list">
         <button className="nav-item active"><span className="nav-dot"></span><span>连接</span><span className="nav-kbd">01</span></button>
@@ -159,7 +159,7 @@ function Dashboard({ account, onLogout }) {
           <div className="hero-bg"></div><div className="hero-content">
             <div className="hero-label"><span className="pulse-ring"></span>{connected ? '隧道运行中' : '准备就绪'}</div>
             <div className="hero-title">{connected ? '你的连接很顺畅。' : '让连接，简单一点。'}</div>
-            <p className="hero-copy">选择一个节点，剩下的交给 Misaka Link。</p>
+            <p className="hero-copy">选择一个节点，剩下的交给 qaletx link。</p>
             <button className={`connect-button ${connected ? 'disconnect' : ''}`} onClick={toggleConnection} disabled={connecting}>{connecting ? <><span className="spinner"></span>正在建立连接</> : connected ? <>断开连接 <Icon name="arrow" size={18}/></> : <>一键连接 <Icon name="arrow" size={18}/></>}</button>
           </div>
           <div className="hero-foot"><span><Icon name="shield" size={15}/>协议 Hysteria2</span><span><Icon name="globe" size={15}/>全局模式</span><span className="hero-foot-right">{connected ? `已保护 ${session.time}` : '等待连接'}</span></div>
@@ -171,10 +171,10 @@ function Dashboard({ account, onLogout }) {
 
         <section className="details-panel"><div className="section-head"><div><div className="eyebrow">ACTIVE CONFIGURATION</div><h2>节点信息</h2></div><button className="copy-button" onClick={copyUri} disabled={!activeNode?.uri}><Icon name="copy" size={15}/>复制链接</button></div><div className="config-box"><div className="config-line"><span>名称</span><strong>{activeNode?.name || '未选择'}</strong></div><div className="config-line"><span>服务器</span><strong>{activeDetails?.server || '—'}</strong></div><div className="config-line"><span>SNI</span><strong>{activeDetails?.sni || '—'}</strong></div><div className="config-line"><span>核心状态</span><strong className={appInfo.core ? 'good' : 'warn'}>{appInfo.core ? '已检测到 Hysteria2' : '演示模式 · 未放入核心'}</strong></div></div></section>
       </div>
-      <footer className="footer"><span><span className="status-pip"></span>Misaka Link 正常运行</span><span>Windows 7+ / macOS Intel & Apple Silicon</span><span>帮助中心 ↗</span></footer>
+      <footer className="footer"><span><span className="status-pip"></span>qaletx link 正常运行</span><span>Windows 7+ / macOS Intel & Apple Silicon</span><span>帮助中心 ↗</span></footer>
     </main>
 
-    {showImport && <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setShowImport(false)}><div className="modal"><div className="modal-head"><div><div className="eyebrow">ADD A ROUTE</div><h2>导入节点</h2></div><button className="close-button" onClick={() => setShowImport(false)}>×</button></div><p className="modal-copy">粘贴 Hysteria2 分享链接，Misaka Link 会自动解析并保存到你的节点列表。</p><textarea autoFocus placeholder="hysteria2://..." value={importText} onChange={(e) => setImportText(e.target.value)}></textarea><div className="modal-example"><span>示例格式</span><code>hysteria2://密码@服务器:端口?sni=域名</code></div><div className="modal-actions"><button className="cancel-button" onClick={() => setShowImport(false)}>取消</button><button className="primary-button" onClick={importNode}><Icon name="upload" size={16}/>添加节点</button></div></div></div>}
+    {showImport && <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setShowImport(false)}><div className="modal"><div className="modal-head"><div><div className="eyebrow">ADD A ROUTE</div><h2>导入节点</h2></div><button className="close-button" onClick={() => setShowImport(false)}>×</button></div><p className="modal-copy">粘贴 Hysteria2 分享链接，qaletx link 会自动解析并保存到你的节点列表。</p><textarea autoFocus placeholder="hysteria2://..." value={importText} onChange={(e) => setImportText(e.target.value)}></textarea><div className="modal-example"><span>示例格式</span><code>hysteria2://密码@服务器:端口?sni=域名</code></div><div className="modal-actions"><button className="cancel-button" onClick={() => setShowImport(false)}>取消</button><button className="primary-button" onClick={importNode}><Icon name="upload" size={16}/>添加节点</button></div></div></div>}
     {showUsers && <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setShowUsers(false)}><div className="modal admin-modal"><div className="modal-head"><div><div className="eyebrow">ROOT CONSOLE</div><h2>用户管理</h2></div><button className="close-button" onClick={() => setShowUsers(false)}>×</button></div><p className="modal-copy">root 可以管理普通用户。密码只在服务器端以加盐哈希保存。</p><div className="stats-strip"><div><strong>{stats.userCount || users.length}</strong><span>总账号</span></div><div><strong>{stats.activeSessions || 0}</strong><span>活跃会话</span></div><div><strong>H2</strong><span>节点协议</span></div></div><div className="user-list">{adminBusy && users.length === 0 ? <div className="admin-loading">正在读取账号…</div> : users.map((user) => <div className="user-row" key={user.username}><div><strong>{user.username}</strong><span>{user.role === 'root' ? '管理员' : '普通用户'}</span></div><div className="user-actions"><em>{user.username === 'root' ? '受保护' : '可管理'}</em>{user.username !== 'root' && <button className="danger-button" onClick={() => deleteUser(user.username)}>删除</button>}</div></div>)}</div><div className="password-editor"><label>修改 user 密码</label><div className="password-row"><input type="password" placeholder="至少 8 位" value={newUserPassword} onChange={(e) => setNewUserPassword(e.target.value)} /><button className="primary-button" onClick={updateUserPassword} disabled={adminBusy}>保存</button></div></div><div className="password-editor create-user"><label>创建普通用户</label><div className="password-row"><input placeholder="账号名" value={newUsername} onChange={(e) => setNewUsername(e.target.value)} /><input type="password" placeholder="初始密码" value={newAccountPassword} onChange={(e) => setNewAccountPassword(e.target.value)} /><button className="primary-button" onClick={createUser} disabled={adminBusy}>创建</button></div></div></div></div>}
     {notice && <div className="toast"><span className="status-pip"></span>{notice}</div>}
   </div>
@@ -203,7 +203,7 @@ function LoginScreen({ onLogin }) {
       onLogin({ ...response.data.user, token: response.data.token, apiUrl: apiUrl.replace(/\/$/, '') })
     } catch (err) { setError(err.message || '登录失败，请检查服务器地址') } finally { setBusy(false) }
   }
-  return <div className="login-shell"><div className="login-orbit"></div><div className="login-card"><div className="brand login-brand"><div className="brand-mark"><span></span><span></span><span></span></div><div><div className="brand-name">MISAKA</div><div className="brand-sub">LINK / CLIENT</div></div></div><div className="eyebrow">PRIVATE NETWORK / SIGN IN</div><h1>连接你的工作区。</h1><p className="login-copy">登录后即可使用节点。管理员账号还可以管理用户权限。</p><form onSubmit={submit}><label>服务器地址<input value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} placeholder="http://服务器地址:8787" /></label><label>账号<input autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} /></label><label>密码<input autoComplete="current-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>{error && <div className="login-error">{error}</div>}<button className="login-button" disabled={busy}>{busy ? <><span className="spinner"></span>正在验证</> : <>进入 Misaka Link <Icon name="arrow" size={18}/></>}</button></form><div className="login-foot"><span><span className="status-pip"></span>安全连接</span><span>Windows / macOS</span></div></div></div>
+  return <div className="login-shell"><div className="login-orbit"></div><div className="login-card"><div className="brand login-brand"><img className="brand-icon" src="./qaletx-link.svg" alt="qaletx link" /><div><div className="brand-name">qaletx link</div><div className="brand-sub">PRIVATE ACCESS</div></div></div><div className="eyebrow">PRIVATE NETWORK / SIGN IN</div><h1>连接你的工作区。</h1><p className="login-copy">登录后即可使用节点。管理员账号还可以管理用户权限。</p><form onSubmit={submit}><label>服务器地址<input value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} placeholder="http://服务器地址:8787" /></label><label>账号<input autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} /></label><label>密码<input autoComplete="current-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>{error && <div className="login-error">{error}</div>}<button className="login-button" disabled={busy}>{busy ? <><span className="spinner"></span>正在验证</> : <>进入 qaletx link <Icon name="arrow" size={18}/></>}</button></form><div className="login-foot"><span><span className="status-pip"></span>安全连接</span><span>Windows / macOS</span></div></div></div>
 }
 
 async function apiFetch(pathname, { baseUrl, token, method = 'GET', body } = {}) {
@@ -227,5 +227,6 @@ function parseNode(uri) {
 }
 
 createRoot(document.getElementById('root')).render(<App />)
+
 
 

@@ -73,7 +73,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return send(res, 204, {})
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
   try {
-    if (req.method === 'GET' && url.pathname === '/api/health') return send(res, 200, { ok: true, service: 'misaka-link-server', time: new Date().toISOString() })
+    if (req.method === 'GET' && url.pathname === '/api/health') return send(res, 200, { ok: true, service: 'qaletx-link-server', time: new Date().toISOString() })
     if (req.method === 'POST' && url.pathname === '/api/login') {
       const { username, password } = await readBody(req)
       const user = users.find((item) => item.username === String(username || '').trim())
@@ -140,4 +140,5 @@ const server = http.createServer(async (req, res) => {
     return send(res, 500, { error: '服务器内部错误' })
   }
 })
-server.listen(PORT, HOST, () => console.log(`Misaka Link server listening on http://${HOST}:${PORT}`))
+server.listen(PORT, HOST, () => console.log(`qaletx link server listening on http://${HOST}:${PORT}`))
+

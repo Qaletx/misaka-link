@@ -1,10 +1,10 @@
 {
-  "name": "misaka-link",
-  "version": "0.2.0",
+  "name": "qaletx-link",
+  "version": "0.3.0",
   "private": true,
-  "description": "A focused Hysteria2 desktop client for Windows 7+ and macOS.",
+  "description": "A simple Hysteria2 desktop client with qaletx link account management.",
   "main": "electron/main.cjs",
-  "author": "Misaka Link",
+  "author": "qaletx link",
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
     "build": "vite build",
@@ -15,8 +15,8 @@
     "dist:mac": "npm run build && electron-builder --mac dmg --universal --publish never"
   },
   "build": {
-    "appId": "com.misaka.link",
-    "productName": "Misaka Link",
+    "appId": "com.qaletx.link",
+    "productName": "qaletx link",
     "asar": true,
     "files": [
       "dist/**/*",
@@ -31,7 +31,8 @@
         "portable",
         "nsis"
       ],
-      "artifactName": "Misaka-Link-${version}-${arch}.${ext}"
+      "artifactName": "qaletx-link-${version}-${arch}.${ext}",
+      "icon": "assets/qaletx-link.ico"
     },
     "nsis": {
       "oneClick": false,
@@ -43,14 +44,16 @@
         "dmg"
       ],
       "category": "public.app-category.utilities",
-      "artifactName": "Misaka-Link-${version}-${arch}.${ext}"
+      "artifactName": "qaletx-link-${version}-${arch}.${ext}",
+      "icon": "assets/qaletx-link.png"
     },
     "dmg": {
       "window": {
         "width": 520,
         "height": 340
       }
-    }
+    },
+    "icon": "assets/qaletx-link.png"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "latest",
@@ -63,4 +66,3 @@
     "wait-on": "latest"
   }
 }
-
