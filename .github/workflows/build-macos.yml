@@ -38,12 +38,14 @@ jobs:
         shell: bash
         run: |
           mkdir -p core
-          curl -L --fail -o /tmp/sing-box-amd64.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-darwin-amd64-legacy-macos-10.13.tar.gz
-          tar -xzf /tmp/sing-box-amd64.tar.gz -C /tmp
-          find /tmp -path '*darwin-amd64*/sing-box' -type f -exec cp {} core/sing-box-amd64 \; -quit
-          curl -L --fail -o /tmp/sing-box-arm64.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-darwin-arm64.tar.gz
-          tar -xzf /tmp/sing-box-arm64.tar.gz -C /tmp
-          find /tmp -path '*darwin-arm64*/sing-box' -type f -exec cp {} core/sing-box-arm64 \; -quit
+          core_tmp="$(mktemp -d)"
+          mkdir -p "$core_tmp/amd64" "$core_tmp/arm64"
+          curl -L --fail -o "$core_tmp/amd64.tar.gz" https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-darwin-amd64-legacy-macos-10.13.tar.gz
+          tar -xzf "$core_tmp/amd64.tar.gz" --strip-components=1 -C "$core_tmp/amd64"
+          cp "$core_tmp/amd64/sing-box" core/sing-box-amd64
+          curl -L --fail -o "$core_tmp/arm64.tar.gz" https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-darwin-arm64.tar.gz
+          tar -xzf "$core_tmp/arm64.tar.gz" --strip-components=1 -C "$core_tmp/arm64"
+          cp "$core_tmp/arm64/sing-box" core/sing-box-arm64
           chmod +x core/sing-box-amd64 core/sing-box-arm64
       - name: Build universal DMG
         run: npm run dist:mac
