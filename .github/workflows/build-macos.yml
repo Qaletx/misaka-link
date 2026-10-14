@@ -3,6 +3,15 @@ name: Build macOS universal app
 on:
   workflow_dispatch:
   push:
+    branches: [main]
+    paths:
+      - 'electron/**'
+      - 'src/**'
+      - 'public/**'
+      - 'assets/**'
+      - 'package*.json'
+      - 'vite.config.js'
+      - '.github/workflows/build-macos.yml'
     tags:
       - 'v*'
 
@@ -11,7 +20,6 @@ permissions:
 
 env:
   VITE_API_URL: ${{ vars.MISAKA_API_URL }}
-  QALETX_PRIVATE_NODE_URI: ${{ secrets.QALETX_PRIVATE_NODE_URI }}
 
 jobs:
   build-macos:

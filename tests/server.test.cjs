@@ -41,6 +41,7 @@ async function fixture(t, options = {}) {
     "MISAKA_ROOT_PASSWORD='" + ROOT_PASSWORD + "'",
     'MISAKA_USER_PASSWORD=' + USER_PASSWORD,
     'MISAKA_TRUSTED_PROXIES=' + (options.trustedProxies || ''),
+    'MISAKA_PRIVATE_NODE_URI=' + (options.privateUri || ''),
     ''
   ].join('\r\n')
   fs.writeFileSync(path.join(directory, '.env'), envText)
@@ -86,6 +87,7 @@ async function fixture(t, options = {}) {
     assert.equal(response.status, 200, JSON.stringify(response.body))
     return response.body.token
   }
+  if (options.prepare) options.prepare(directory)
   await start()
   return { directory, port, request, login, start, stop, logs: () => output }
 }
@@ -104,7 +106,7 @@ test('two-file deployment, complete safeUser, permissions, root protection and C
   const root = await app.login()
   const user = await app.login('user', USER_PASSWORD)
   const me = await app.request('GET', '/api/me', undefined, user)
-  assert.deepEqual(Object.keys(me.body.user).sort(), ['createdAt', 'disabled', 'expiresAt', 'role', 'updatedAt', 'username'])
+  assert.deepEqual(Object.keys(me.body.user).sort(), ['createdAt', 'disabled', 'expiresAt', 'isRoot', 'permissions', 'privateNodeAccess', 'privateNodeIds', 'role', 'updatedAt', 'username'])
   assert.equal(me.body.user.disabled, false)
   assert.equal(me.body.user.expiresAt, null)
   for (const [method, endpoint, body] of [
@@ -117,7 +119,7 @@ test('two-file deployment, complete safeUser, permissions, root protection and C
   assert.equal((await app.request('DELETE', '/api/users/root', undefined, root)).status, 400)
   assert.equal((await app.request('PATCH', '/api/users/root', { disabled: true }, root)).status, 400)
   assert.equal((await app.request('PATCH', '/api/users/root', { expiresAt: '2099-01-01T00:00:00Z' }, root)).status, 400)
-  const created = await app.request('POST', '/api/users', { username: 'Alice', password: 'test-new-password', role: 'root' }, root)
+  const created = await app.request('POST', '/api/users', { username: 'Alice', password: 'test-new-password', role: 'user' }, root)
   assert.equal(created.status, 201)
   assert.equal(created.body.user.username, 'alice')
   assert.equal(created.body.user.role, 'user')
@@ -203,11 +205,11 @@ test('disable, re-enable and expiry enforce access and persist safely', async t 
   assert.equal((await app.request('GET', '/api/stats', undefined, root)).body.activeSessions, 1)
   assert.equal((await app.request('PATCH', '/api/users/user', { expiresAt: null }, root)).status, 200)
   await app.login('user', USER_PASSWORD)
-  const userFile = fs.readFileSync(path.join(app.directory, 'data', 'users.json'), 'utf8')
+  const userFile = fs.readFileSync(path.join(app.directory, 'data', 'state.json'), 'utf8')
   assert.ok(!userFile.includes(USER_PASSWORD))
   assert.ok(!userFile.includes(ROOT_PASSWORD))
-  assert.equal(JSON.parse(userFile).find(user => user.username === 'user').expiresAt, null)
-  assert.deepEqual(fs.readdirSync(path.join(app.directory, 'data')), ['users.json'])
+  assert.equal(JSON.parse(userFile).users.find(user => user.username === 'user').expiresAt, null)
+  assert.deepEqual(fs.readdirSync(path.join(app.directory, 'data')), ['state.json'])
 })
 
 test('restart keeps accounts and passwords but invalidates in-memory sessions', async t => {
@@ -262,7 +264,7 @@ test('only 10 recent sessions per account stay valid', async t => {
 test('failed atomic save leaves in-memory accounts unchanged', async t => {
   const app = await fixture(t)
   const root = await app.login()
-  const userFile = path.join(app.directory, 'data', 'users.json')
+  const userFile = path.join(app.directory, 'data', 'state.json')
   const backup = path.join(app.directory, 'data', 'users.backup.json')
   fs.renameSync(userFile, backup)
   fs.mkdirSync(userFile)
@@ -297,4 +299,289 @@ test('revoked administrator cannot finish an already pending user mutation', asy
   assert.equal(await completion, 401)
   const replacement = await app.login()
   assert.ok(!(await app.request('GET', '/api/users', undefined, replacement)).body.users.some(user => user.username === 'pendinguser'))
+})
+
+const PRIVATE_URI = 'hysteria2://test-private-secret@private.example:443?sni=example.com#Default'
+const PERSONAL_URI = 'socks5://tester:secret@127.0.0.1:10080#Original'
+const NEW_PASSWORD = 'new-test-account-password'
+
+async function createUser(app, root, username, role = 'user', extra = {}) {
+  const response = await app.request('POST', '/api/users', { username, password: NEW_PASSWORD, role, ...extra }, root)
+  assert.equal(response.status, 201, JSON.stringify(response.body))
+  return response.body.user
+}
+
+test('three roles expose correct permissions; only root can administer administrators or private grants', async t => {
+  const app = await fixture(t, { privateUri: PRIVATE_URI })
+  const root = await app.login()
+  const adminUser = await createUser(app, root, 'manager', 'admin')
+  await createUser(app, root, 'group', 'shared')
+  const admin = await app.login('manager', NEW_PASSWORD)
+  const shared = await app.login('group', NEW_PASSWORD)
+  assert.equal(adminUser.isRoot, false)
+  assert.deepEqual(adminUser.permissions, { manageUsers: true, managePrivateNodes: false, changePassword: true, syncNodes: true })
+  const sharedMe = (await app.request('GET', '/api/me', undefined, shared)).body.user
+  assert.deepEqual(sharedMe.permissions, { manageUsers: false, managePrivateNodes: false, changePassword: false, syncNodes: false })
+  assert.equal(sharedMe.privateNodeAccess, false)
+  assert.deepEqual(sharedMe.privateNodeIds, [])
+  const rootMe = (await app.request('GET', '/api/me', undefined, root)).body.user
+  assert.equal(rootMe.isRoot, true)
+  assert.equal(rootMe.role, 'admin')
+  assert.equal(rootMe.permissions.managePrivateNodes, true)
+  assert.equal((await app.request('PATCH', '/api/users/root', { role: 'user' }, root)).status, 400)
+  assert.equal((await app.request('POST', '/api/users', { username: 'badrole', password: NEW_PASSWORD, role: 'root' }, root)).status, 400)
+  const managed = await createUser(app, admin, 'managed', 'shared')
+  assert.equal(managed.role, 'shared')
+  for (const [method, endpoint, body] of [
+    ['POST', '/api/users', { username: 'elevated', password: NEW_PASSWORD, role: 'admin' }],
+    ['POST', '/api/users', { username: 'granted', password: NEW_PASSWORD, privateNodeAccess: true }],
+    ['PATCH', '/api/users/managed', { role: 'admin' }],
+    ['PATCH', '/api/users/managed', { privateNodeAccess: true }],
+    ['PATCH', '/api/users/managed', { privateNodeIds: ['misaka'] }],
+    ['PATCH', '/api/users/manager', { disabled: true }],
+    ['PATCH', '/api/users/root', { role: 'user' }],
+    ['PATCH', '/api/users/root/password', { password: NEW_PASSWORD }],
+    ['DELETE', '/api/users/manager'],
+    ['POST', '/api/private-nodes', { uri: PERSONAL_URI }]
+  ]) assert.equal((await app.request(method, endpoint, body, admin)).status, 403, method + ' ' + endpoint)
+  const visible = (await app.request('GET', '/api/users', undefined, admin)).body.users
+  assert.ok(visible.every(user => user.role !== 'admin'))
+  assert.equal((await app.request('PATCH', '/api/users/managed', { role: 'user' }, admin)).status, 200)
+  assert.equal((await app.request('PATCH', '/api/users/managed/password', { password: NEW_PASSWORD + '-reset' }, admin)).status, 200)
+  assert.equal((await app.request('DELETE', '/api/users/managed', undefined, admin)).status, 200)
+})
+
+test('shared accounts cannot change their password or write personal nodes; administrators can reset them', async t => {
+  const app = await fixture(t)
+  const root = await app.login()
+  await createUser(app, root, 'sharedone', 'shared')
+  const shared = await app.login('sharedone', NEW_PASSWORD)
+  for (const [method, endpoint, body] of [
+    ['POST', '/api/me/password', { currentPassword: NEW_PASSWORD, password: NEW_PASSWORD + '-changed' }],
+    ['PATCH', '/api/users/sharedone/password', { password: NEW_PASSWORD + '-changed' }],
+    ['POST', '/api/nodes', { uri: PERSONAL_URI }],
+    ['PATCH', '/api/nodes/misaka', { name: 'cannot', revision: 1 }],
+    ['DELETE', '/api/nodes/misaka'],
+    ['PATCH', '/api/node-annotations/misaka', { name: 'cannot' }]
+  ]) assert.equal((await app.request(method, endpoint, body, shared)).status, 403)
+  assert.equal((await app.request('GET', '/api/me', undefined, shared)).status, 200)
+  assert.equal((await app.request('PATCH', '/api/users/sharedone/password', { password: NEW_PASSWORD + '-admin' }, root)).status, 200)
+  assert.equal((await app.request('GET', '/api/me', undefined, shared)).status, 401)
+  await app.login('sharedone', NEW_PASSWORD + '-admin')
+})
+
+test('personal nodes sync across sessions and restart with isolation, URI deduplication and revision conflicts', async t => {
+  const app = await fixture(t)
+  const root = await app.login()
+  const first = await app.login('user', USER_PASSWORD)
+  const second = await app.login('user', USER_PASSWORD)
+  const created = await app.request('POST', '/api/nodes', { uri: PERSONAL_URI, name: 'My line', note: 'Office' }, first)
+  assert.equal(created.status, 201)
+  const node = created.body.node
+  assert.equal(node.revision, 1)
+  assert.equal(node.uri, PERSONAL_URI)
+  const duplicate = await app.request('POST', '/api/nodes', { uri: PERSONAL_URI.replace('#Original', '#Other%20Name'), name: 'Not a rename' }, second)
+  assert.equal(duplicate.status, 200)
+  assert.equal(duplicate.body.existing, true)
+  assert.equal(duplicate.body.node.id, node.id)
+  assert.equal(duplicate.body.node.name, 'My line')
+  const rootNodes = (await app.request('GET', '/api/nodes', undefined, root)).body.nodes
+  assert.equal(rootNodes.length, 0)
+  assert.equal((await app.request('GET', '/api/nodes/' + node.id + '/config', undefined, root)).status, 403)
+  assert.equal((await app.request('PATCH', '/api/nodes/' + node.id, { name: 'Steal', revision: 1 }, root)).status, 403)
+  assert.equal((await app.request('DELETE', '/api/nodes/' + node.id, undefined, root)).status, 403)
+  assert.equal((await app.request('PATCH', '/api/nodes/' + node.id, { name: 'No revision' }, first)).status, 400)
+  assert.equal((await app.request('PATCH', '/api/nodes/' + node.id, { name: 'Renamed', note: 'New note', revision: 1 }, first)).status, 200)
+  assert.equal((await app.request('PATCH', '/api/nodes/' + node.id, { name: 'Lost update', revision: 1 }, second)).status, 409)
+  const synced = (await app.request('GET', '/api/nodes', undefined, second)).body.nodes[0]
+  assert.equal(synced.name, 'Renamed')
+  assert.equal(synced.note, 'New note')
+  assert.equal(synced.revision, 2)
+  await app.stop(); await app.start()
+  const restarted = await app.login('user', USER_PASSWORD)
+  assert.deepEqual((await app.request('GET', '/api/nodes', undefined, restarted)).body.nodes[0], synced)
+  assert.equal((await app.request('DELETE', '/api/nodes/' + node.id, undefined, restarted)).status, 200)
+  assert.deepEqual((await app.request('GET', '/api/nodes', undefined, restarted)).body.nodes, [])
+})
+
+test('private grants hide credentials in metadata and revoke config access immediately without session logout', async t => {
+  const app = await fixture(t, { privateUri: PRIVATE_URI })
+  const root = await app.login()
+  const user = await app.login('user', USER_PASSWORD)
+  await createUser(app, root, 'sharedtwo', 'shared')
+  const shared = await app.login('sharedtwo', NEW_PASSWORD)
+  assert.deepEqual((await app.request('GET', '/api/nodes', undefined, user)).body.nodes, [])
+  assert.equal((await app.request('GET', '/api/nodes/misaka/config', undefined, user)).status, 403)
+  const rootNodes = (await app.request('GET', '/api/nodes', undefined, root)).body.nodes
+  assert.equal(rootNodes[0].id, 'misaka')
+  assert.ok(!('uri' in rootNodes[0]))
+  assert.ok(!JSON.stringify(rootNodes).includes('private.example'))
+  assert.equal((await app.request('PATCH', '/api/users/user', { privateNodeAccess: true, privateNodeIds: ['missing'] }, root)).status, 400)
+  assert.equal((await app.request('PATCH', '/api/users/user', { privateNodeIds: ['misaka'] }, root)).status, 200)
+  assert.equal((await app.request('GET', '/api/nodes/misaka/config', undefined, user)).status, 403)
+  assert.equal((await app.request('PATCH', '/api/users/user', { privateNodeAccess: true }, root)).status, 200)
+  const configuration = await app.request('GET', '/api/nodes/misaka/config', undefined, user)
+  assert.equal(configuration.status, 200)
+  assert.equal(configuration.body.uri, PRIVATE_URI)
+  assert.ok(!('uri' in configuration.body.node))
+  assert.equal((await app.request('PATCH', '/api/users/sharedtwo', { privateNodeAccess: true, privateNodeIds: ['misaka'] }, root)).status, 200)
+  assert.equal((await app.request('GET', '/api/nodes/misaka/config', undefined, shared)).status, 200)
+  assert.equal((await app.request('PATCH', '/api/users/user', { privateNodeAccess: false }, root)).status, 200)
+  assert.equal((await app.request('GET', '/api/me', undefined, user)).status, 200)
+  assert.equal((await app.request('GET', '/api/nodes/misaka/config', undefined, user)).status, 403)
+  assert.equal((await app.request('PATCH', '/api/users/user', { privateNodeAccess: true, privateNodeIds: [] }, root)).status, 200)
+  assert.equal((await app.request('GET', '/api/nodes/misaka/config', undefined, user)).status, 403)
+})
+
+test('root converts personal nodes to multiple private nodes and users have isolated annotations', async t => {
+  const app = await fixture(t, { privateUri: PRIVATE_URI })
+  const root = await app.login()
+  const user = await app.login('user', USER_PASSWORD)
+  const personal = (await app.request('POST', '/api/nodes', { uri: PERSONAL_URI, name: 'Team line', note: 'Global note' }, root)).body.node
+  const converted = await app.request('POST', '/api/private-nodes', { sourceNodeId: personal.id }, root)
+  assert.equal(converted.status, 201)
+  assert.equal(converted.body.node.id, personal.id)
+  assert.equal(converted.body.node.private, true)
+  assert.equal(converted.body.node.revision, 2)
+  assert.ok(!('uri' in converted.body.node))
+  assert.equal((await app.request('GET', '/api/nodes', undefined, root)).body.nodes.length, 2)
+  assert.equal((await app.request('POST', '/api/private-nodes', { uri: PERSONAL_URI }, root)).status, 409)
+  const own = (await app.request('POST', '/api/nodes', { uri: PERSONAL_URI }, user)).body.node
+  assert.equal((await app.request('POST', '/api/private-nodes', { sourceNodeId: own.id }, root)).status, 404)
+  assert.equal((await app.request('POST', '/api/private-nodes', { sourceNodeId: own.id }, user)).status, 403)
+  await app.request('PATCH', '/api/users/user', { privateNodeAccess: true, privateNodeIds: [personal.id] }, root)
+  const annotated = await app.request('PATCH', '/api/node-annotations/' + personal.id, { name: 'My alias', note: 'My note' }, user)
+  assert.equal(annotated.status, 200)
+  assert.equal(annotated.body.node.name, 'My alias')
+  assert.ok(!('uri' in annotated.body.node))
+  assert.equal((await app.request('GET', '/api/nodes', undefined, root)).body.nodes.find(node => node.id === personal.id).name, 'Team line')
+  assert.equal((await app.request('PATCH', '/api/private-nodes/' + personal.id, { name: 'New global name', revision: 2 }, root)).status, 200)
+  assert.equal((await app.request('PATCH', '/api/private-nodes/' + personal.id, { name: 'Stale', revision: 2 }, root)).status, 409)
+  assert.equal((await app.request('GET', '/api/nodes', undefined, user)).body.nodes.find(node => node.id === personal.id).name, 'My alias')
+  assert.equal((await app.request('PATCH', '/api/nodes/' + personal.id, { name: 'Unauthorized', revision: 3 }, user)).status, 403)
+  assert.equal((await app.request('DELETE', '/api/private-nodes/' + personal.id, undefined, user)).status, 403)
+  assert.equal((await app.request('DELETE', '/api/private-nodes/' + personal.id, undefined, root)).status, 200)
+  assert.equal((await app.request('GET', '/api/nodes/' + personal.id + '/config', undefined, user)).status, 404)
+  assert.deepEqual((await app.request('GET', '/api/me', undefined, user)).body.user.privateNodeIds, [])
+  const saved = JSON.parse(fs.readFileSync(path.join(app.directory, 'data', 'state.json'), 'utf8'))
+  assert.equal(saved.annotations.length, 0)
+  assert.equal(saved.nodes.some(node => node.id === personal.id), false)
+})
+
+test('legacy users migrate once preserving password hashes and original file, and later restarts do not resurrect deleted nodes', async t => {
+  let original
+  const app = await fixture(t, { privateUri: PRIVATE_URI, prepare(directory) {
+    const now = new Date().toISOString()
+    const legacy = [['root', 'root', ROOT_PASSWORD], ['user', 'user', USER_PASSWORD]].map(([username, role, password]) => {
+      const salt = crypto.randomBytes(16).toString('hex')
+      return { username, role, salt, hash: crypto.scryptSync(password, salt, 64).toString('hex'), createdAt: now, updatedAt: now }
+    })
+    original = JSON.stringify(legacy, null, 2)
+    fs.mkdirSync(path.join(directory, 'data'))
+    fs.writeFileSync(path.join(directory, 'data', 'users.json'), original)
+  } })
+  const root = await app.login()
+  const user = await app.login('user', USER_PASSWORD)
+  const current = (await app.request('GET', '/api/me', undefined, user)).body.user
+  assert.equal(current.privateNodeAccess, true)
+  assert.deepEqual(current.privateNodeIds, ['misaka'])
+  assert.equal((await app.request('GET', '/api/nodes/misaka/config', undefined, user)).status, 200)
+  assert.equal(fs.readFileSync(path.join(app.directory, 'data', 'users.json'), 'utf8'), original)
+  const saved = JSON.parse(fs.readFileSync(path.join(app.directory, 'data', 'state.json'), 'utf8'))
+  assert.equal(saved.schemaVersion, 2)
+  assert.equal(saved.users.find(item => item.username === 'root').role, 'admin')
+  assert.equal(saved.users[0].hash, JSON.parse(original)[0].hash)
+  assert.equal((await app.request('DELETE', '/api/private-nodes/misaka', undefined, root)).status, 200)
+  await app.stop(); await app.start()
+  const nextRoot = await app.login()
+  assert.deepEqual((await app.request('GET', '/api/nodes', undefined, nextRoot)).body.nodes, [])
+})
+
+test('changing an account to shared revokes sessions and hides previously synced personal nodes', async t => {
+  const app = await fixture(t)
+  const root = await app.login()
+  const user = await app.login('user', USER_PASSWORD)
+  const created = (await app.request('POST', '/api/nodes', { uri: PERSONAL_URI }, user)).body.node
+  assert.equal((await app.request('PATCH', '/api/users/user', { role: 'shared' }, root)).status, 200)
+  assert.equal((await app.request('GET', '/api/me', undefined, user)).status, 401)
+  const shared = await app.login('user', USER_PASSWORD)
+  assert.deepEqual((await app.request('GET', '/api/nodes', undefined, shared)).body.nodes, [])
+  assert.equal((await app.request('GET', '/api/nodes/' + created.id + '/config', undefined, shared)).status, 403)
+  assert.equal((await app.request('POST', '/api/me/password', { currentPassword: USER_PASSWORD, password: NEW_PASSWORD }, shared)).status, 403)
+  assert.equal((await app.request('PATCH', '/api/users/user', { role: 'user' }, root)).status, 200)
+  const restored = await app.login('user', USER_PASSWORD)
+  assert.equal((await app.request('GET', '/api/nodes', undefined, restored)).body.nodes[0].id, created.id)
+  assert.equal((await app.request('DELETE', '/api/users/user', undefined, root)).status, 200)
+  const saved = JSON.parse(fs.readFileSync(path.join(app.directory, 'data', 'state.json'), 'utf8'))
+  assert.ok(!saved.nodes.some(node => node.owner === 'user'))
+})
+
+test('node validation rejects bad protocols, fields and overlong metadata; accounts are limited to 200 personal nodes', async t => {
+  const app = await fixture(t)
+  const user = await app.login('user', USER_PASSWORD)
+  for (const body of [
+    { uri: 'javascript://alert(1)' }, { uri: 'socks5://bad host' }, { uri: 42 },
+    { uri: PERSONAL_URI, name: 'x'.repeat(101) }, { uri: PERSONAL_URI, note: 'x'.repeat(501) },
+    { uri: PERSONAL_URI, private: true }, { uri: PERSONAL_URI, owner: 'root' }
+  ]) assert.equal((await app.request('POST', '/api/nodes', body, user)).status, 400)
+  for (let index = 0; index < 200; index += 1) {
+    assert.equal((await app.request('POST', '/api/nodes', { uri: 'socks5://127.0.0.1:' + (20000 + index) }, user)).status, 201)
+  }
+  assert.equal((await app.request('POST', '/api/nodes', { uri: 'socks5://127.0.0.1:25000' }, user)).status, 400)
+  assert.equal((await app.request('POST', '/api/nodes', { uri: 'socks5://127.0.0.1:20000#Duplicate' }, user)).status, 200)
+})
+
+test('failed private-node transaction preserves node, grants, annotations and sessions atomically', async t => {
+  const app = await fixture(t, { privateUri: PRIVATE_URI })
+  const root = await app.login()
+  const user = await app.login('user', USER_PASSWORD)
+  await app.request('PATCH', '/api/users/user', { privateNodeAccess: true, privateNodeIds: ['misaka'] }, root)
+  await app.request('PATCH', '/api/node-annotations/misaka', { name: 'Saved alias', note: 'Saved note' }, user)
+  const stateFile = path.join(app.directory, 'data', 'state.json')
+  const backup = path.join(app.directory, 'data', 'state.backup.json')
+  const before = fs.readFileSync(stateFile, 'utf8')
+  fs.renameSync(stateFile, backup); fs.mkdirSync(stateFile)
+  try {
+    assert.equal((await app.request('DELETE', '/api/private-nodes/misaka', undefined, root)).status, 500)
+    assert.equal((await app.request('GET', '/api/nodes/misaka/config', undefined, user)).status, 200)
+    assert.deepEqual((await app.request('GET', '/api/me', undefined, user)).body.user.privateNodeIds, ['misaka'])
+    assert.equal((await app.request('GET', '/api/nodes', undefined, user)).body.nodes[0].name, 'Saved alias')
+    assert.equal((await app.request('PATCH', '/api/users/user', { disabled: true }, root)).status, 500)
+    assert.equal((await app.request('GET', '/api/me', undefined, user)).status, 200)
+    assert.ok(!fs.readdirSync(path.join(app.directory, 'data')).some(name => name.endsWith('.tmp')))
+    assert.equal(fs.readFileSync(backup, 'utf8'), before)
+  } finally { fs.rmdirSync(stateFile); fs.renameSync(backup, stateFile) }
+  assert.equal((await app.request('DELETE', '/api/private-nodes/misaka', undefined, root)).status, 200)
+})
+
+test('demoted administrator cannot finish a pending account privilege change', async t => {
+  const app = await fixture(t)
+  const root = await app.login()
+  await createUser(app, root, 'pendingadmin', 'admin')
+  const admin = await app.login('pendingadmin', NEW_PASSWORD)
+  let pending
+  const body = JSON.stringify({ password: 'changed-password-after-demotion' })
+  const completion = new Promise((resolve, reject) => {
+    pending = http.request({ host: '127.0.0.1', port: app.port, method: 'PATCH', path: '/api/users/user/password', headers: {
+      Authorization: 'Bearer ' + admin, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body)
+    } }, response => { response.resume(); response.on('end', () => resolve(response.statusCode)) })
+    pending.on('error', reject); pending.write(body.slice(0, 1))
+  })
+  await delay(50)
+  assert.equal((await app.request('PATCH', '/api/users/pendingadmin', { role: 'user' }, root)).status, 200)
+  pending.end(body.slice(1))
+  assert.equal(await completion, 401)
+  await app.login('user', USER_PASSWORD)
+})
+
+
+test('shared account retains more than 10 concurrent sessions without kicking out its first customer', async t => {
+  const app = await fixture(t)
+  const root = await app.login()
+  await createUser(app, root, 'manyclients', 'shared')
+  const tokens = []
+  for (let index = 0; index < 11; index += 1) tokens.push(await app.login('manyclients', NEW_PASSWORD))
+  assert.equal((await app.request('GET', '/api/me', undefined, tokens[0])).status, 200)
+  assert.equal((await app.request('GET', '/api/me', undefined, tokens[10])).status, 200)
+  assert.equal((await app.request('GET', '/api/stats', undefined, root)).body.activeSessions, 12)
 })

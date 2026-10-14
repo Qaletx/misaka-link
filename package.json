@@ -1,13 +1,13 @@
 {
   "name": "qaletx-link",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "Simple multi-protocol desktop proxy client and Node.js account service",
   "main": "electron/main.cjs",
   "author": "qaletx link",
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron . --dev\"",
-    "build": "node scripts/prepare-private-node.cjs && vite build",
+    "build": "vite build",
     "preview": "vite preview",
     "start": "electron .",
     "server": "node server.js",
@@ -23,7 +23,8 @@
     "files": [
       "dist/**/*",
       "electron/**/*",
-      "package.json"
+      "package.json",
+      "!electron/private-node.cjs"
     ],
     "extraResources": [
       {

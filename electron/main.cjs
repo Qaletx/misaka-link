@@ -5,10 +5,10 @@ const {spawn}=require('child_process')
 const {CoreManager}=require('./core-manager.cjs')
 const {SystemProxy}=require('./system-proxy.cjs')
 const {describeNode}=require('./protocols.cjs')
-let privateNodes={}
-try {privateNodes=require('./private-node.cjs')}catch{}
+const {NodeProbe}=require('./node-probe.cjs')
+const {ConnectionSession}=require('./connection-session.cjs')
 if(!app.isPackaged && process.env.QALETX_TEST_PROFILE) app.setPath('userData',process.env.QALETX_TEST_PROFILE)
-let mainWindow,tray,manager,quitting=false,quitReady=false
+let mainWindow,tray,manager,accountSession,quitting=false,quitReady=false
 const dataPath=app.getPath('userData')
 const journal=path.join(dataPath,'proxy-recovery.json')
 const proxy=new SystemProxy(journal)
@@ -27,7 +27,7 @@ function updateTray() {
   tray.setContextMenu(Menu.buildFromTemplate([
     {label:state.connected?'已连接':'未连接',enabled:false},
     {label:'打开 qaletx link',click:showWindow},
-    {label:'断开连接',enabled:state.phase==='connected'||state.phase==='connecting',click:()=>manager.disconnect()},
+    {label:'断开连接',enabled:state.phase==='connected'||state.phase==='connecting',click:()=>accountSession.disconnect()},
     {type:'separator'},
     {label:'退出 qaletx link',click:()=>app.quit()}
   ]))
@@ -58,7 +58,7 @@ function createWindow() {
   })
   mainWindow.webContents.setWindowOpenHandler(()=>({action:'deny'}))
   mainWindow.webContents.on('will-navigate',event=>event.preventDefault())
-  mainWindow.webContents.on('render-process-gone',()=>manager.disconnect())
+  mainWindow.webContents.on('render-process-gone',()=>accountSession.clearSession())
   const devUrl=!app.isPackaged && process.argv.includes('--dev')?'http://127.0.0.1:5173':null
   if(devUrl) mainWindow.loadURL(devUrl)
   else mainWindow.loadFile(path.join(__dirname,'..','dist','index.html'))
@@ -86,10 +86,13 @@ else {
   app.whenReady().then(async()=>{
     Menu.setApplicationMenu(null)
     manager=new CoreManager({binary:locateCore(),directory:path.join(dataPath,'sessions'),proxy,onSpawn:guardian})
+    accountSession=new ConnectionSession({manager,createProbe:()=>new NodeProbe({binary:locateCore(),directory:path.join(dataPath,'probes'),onSpawn:guardian})})
     try { await proxy.restore() } catch { manager.update({phase:'error',systemProxy:true,error:'上次代理设置恢复失败，请在系统网络设置关闭代理后重试'});manager.log('error','启动时代理恢复失败') }
     const sessions=path.join(dataPath,'sessions')
     if(fs.existsSync(sessions)) for(const name of fs.readdirSync(sessions)) if(/^session-[a-f0-9]+\.json$/.test(name)) try{fs.unlinkSync(path.join(sessions,name))}catch{}
-    handle('app:get-info',()=>({platform:process.platform,version:app.getVersion(),core:Boolean(locateCore()),coreName:'sing-box',privateNode:Boolean(privateNodes.misaka),tray:Boolean(tray)}))
+    handle('app:get-info',()=>({platform:process.platform,version:app.getVersion(),core:Boolean(locateCore()),coreName:'sing-box',privateNodeSource:'server',port:10808,tray:Boolean(tray)}))
+    handle('account:set-session',credentials=>accountSession.setSession(credentials))
+    handle('account:clear-session',()=>accountSession.clearSession())
     handle('core:get-status',()=>manager.status())
     handle('core:get-logs',()=>manager.logs.slice())
     handle('nodes:validate',text=>{
@@ -102,13 +105,9 @@ else {
       })
       return {ok:nodes.length>0,nodes,errors}
     })
-    handle('core:connect',payload=>{
-      if(!payload || typeof payload!=='object') return {ok:false,message:'节点配置为空'}
-      const uri=payload.privateId?privateNodes[payload.privateId]:payload.uri
-      if(typeof uri!=='string' || uri.length>32768) return {ok:false,message:'节点配置为空或已失效'}
-      return manager.connect({uri,id:String(payload.id||payload.privateId||'').slice(0,200),name:String(payload.name||'节点').slice(0,100),mode:payload.mode||'global'})
-    })
-    handle('core:disconnect',()=>manager.disconnect())
+    handle('core:connect',payload=>accountSession.connect(payload))
+    handle('nodes:test',payload=>accountSession.testNode(payload))
+    handle('core:disconnect',()=>accountSession.disconnect())
     handle('app:quit',()=>{app.quit();return {ok:true}})
     let lastPhase=''
     manager.on('status',state=>{
@@ -117,13 +116,13 @@ else {
     })
     createTray();createWindow()
     app.on('activate',showWindow)
-    powerMonitor.on('suspend',()=>manager.disconnect())
+    powerMonitor.on('suspend',()=>accountSession.disconnect())
   })
   app.on('before-quit',event=>{
     if(quitReady) return
     event.preventDefault(); if(quitting) return
     quitting=true
-    Promise.resolve(manager?.disconnect()).finally(()=>{quitReady=true;tray?.destroy();app.quit()})
+    Promise.resolve(accountSession?.clearSession()).finally(()=>{quitReady=true;tray?.destroy();app.quit()})
   })
   app.on('window-all-closed',()=>{if(!tray&&!quitting) app.quit()})
 }

@@ -7,7 +7,7 @@ const os = require('node:os')
 const path = require('node:path')
 const http = require('node:http')
 const net = require('node:net')
-const { CoreManager, controller } = require('../electron/core-manager.cjs')
+const { CoreManager, controller, freePort } = require('../electron/core-manager.cjs')
 
 const corePath = process.env.QALETX_TEST_CORE || path.join(__dirname, '..', 'core', process.platform === 'win32' ? 'sing-box.exe' : process.platform === 'darwin' ? `sing-box-${process.arch === 'arm64' ? 'arm64' : 'amd64'}` : 'sing-box')
 const hasCore = fs.existsSync(corePath)
@@ -91,7 +91,7 @@ async function localNetwork({ rejectConnect = false, holdProbe = false } = {}) {
   }
 }
 
-function instance(extra = {}) {
+async function instance(extra = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'qaletx-core-manager-'))
   const proxy = {
     enabled: false, enabledPorts: [], restoreCalls: 0, failRestore: false,
@@ -106,6 +106,7 @@ function instance(extra = {}) {
   const guardians = []
   const manager = new CoreManager({
     binary: corePath,
+    proxyPort: await freePort(),
     directory,
     proxy,
     onSpawn: async (pid) => {
@@ -140,7 +141,7 @@ function requestThrough(port, url) {
 }
 
 test('a queued connect is cancelled before any child or proxy is started', async () => {
-  const context = instance()
+  const context = await instance()
   try {
     const connecting = context.manager.connect({ uri: 'http://127.0.0.1:1' })
     const disconnecting = context.manager.disconnect()
@@ -155,7 +156,7 @@ test('a queued connect is cancelled before any child or proxy is started', async
 })
 
 test('restoration failure blocks a new connection before validating or spawning', async () => {
-  const context = instance()
+  const context = await instance()
   context.proxy.failRestore = true
   try {
     const result = await context.manager.connect({ uri: 'http://127.0.0.1:1' })
@@ -169,7 +170,7 @@ test('restoration failure blocks a new connection before validating or spawning'
 })
 
 test('missing core never enables the proxy', async () => {
-  const context = instance({ binary: path.join(os.tmpdir(), 'qaletx-does-not-exist.exe') })
+  const context = await instance({ binary: path.join(os.tmpdir(), 'qaletx-does-not-exist.exe') })
   try {
     const result = await context.manager.connect({ uri: 'http://127.0.0.1:1' })
     assert.equal(result.ok, false)
@@ -180,7 +181,7 @@ test('missing core never enables the proxy', async () => {
 })
 
 test('invalid protocol fails cleanly before spawning and leaves no config', { skip: !hasCore }, async () => {
-  const context = instance()
+  const context = await instance()
   try {
     const result = await context.manager.connect({ uri: 'unsupported://127.0.0.1:1' })
     assert.equal(result.ok, false)
@@ -193,7 +194,7 @@ test('invalid protocol fails cleanly before spawning and leaves no config', { sk
 
 test('real core proves local upstream reachability before enabling proxy and reports real traffic', { skip: !hasCore }, async () => {
   const network = await localNetwork()
-  const context = instance({ probeUrls: [network.probeUrl] })
+  const context = await instance({ probeUrls: [network.probeUrl] })
   const states = []
   context.manager.on('status', (state) => states.push(state))
   const enable = context.proxy.enable.bind(context.proxy)
@@ -227,7 +228,7 @@ test('real core proves local upstream reachability before enabling proxy and rep
 
 test('real core rejects unreachable upstream without reporting connected or changing system proxy', { skip: !hasCore }, async () => {
   const network = await localNetwork({ rejectConnect: true })
-  const context = instance({ probeUrls: [network.probeUrl] })
+  const context = await instance({ probeUrls: [network.probeUrl] })
   const states = []
   context.manager.on('status', (state) => states.push(state))
   try {
@@ -245,7 +246,7 @@ test('real core rejects unreachable upstream without reporting connected or chan
 
 test('disconnect during an in-flight probe cancels connection without enabling proxy', { skip: !hasCore }, async () => {
   const network = await localNetwork({ holdProbe: true })
-  const context = instance({ probeUrls: [network.probeUrl] })
+  const context = await instance({ probeUrls: [network.probeUrl] })
   try {
     const connecting = context.manager.connect({ uri: network.uri })
     await until(() => network.state.probes === 1)
@@ -264,7 +265,7 @@ test('disconnect during an in-flight probe cancels connection without enabling p
 
 test('disconnect cancels both the active request and all older queued connects', { skip: !hasCore }, async () => {
   const network = await localNetwork({ holdProbe: true })
-  const context = instance({ probeUrls: [network.probeUrl] })
+  const context = await instance({ probeUrls: [network.probeUrl] })
   try {
     const first = context.manager.connect({ uri: network.uri, id: 'active' })
     await until(() => network.state.probes === 1)
@@ -282,7 +283,7 @@ test('disconnect cancels both the active request and all older queued connects',
 
 test('consecutive connections and disconnections serialize, close prior children and permit reconnect', { skip: !hasCore }, async () => {
   const network = await localNetwork()
-  const context = instance({ probeUrls: [network.probeUrl] })
+  const context = await instance({ probeUrls: [network.probeUrl] })
   try {
     const first = context.manager.connect({ uri: network.uri, id: 'one' })
     const second = context.manager.connect({ uri: network.uri, id: 'two' })
@@ -297,12 +298,13 @@ test('consecutive connections and disconnections serialize, close prior children
     assert.equal(context.manager.status().nodeId, 'three')
     assert.equal(context.spawns.length, 3)
     assert.equal(context.proxy.enabledPorts.length, 3)
+    assert.ok(context.proxy.enabledPorts.every((port) => port === context.manager.status().port), 'switching must keep the configured proxy port')
   } finally { await context.cleanup(); await network.close() }
 })
 
 test('unexpected real core exit restores proxy and publishes an error', { skip: !hasCore }, async () => {
   const network = await localNetwork()
-  const context = instance({ probeUrls: [network.probeUrl] })
+  const context = await instance({ probeUrls: [network.probeUrl] })
   try {
     assert.equal((await context.manager.connect({ uri: network.uri })).ok, true)
     context.manager.child.kill()
@@ -318,7 +320,7 @@ test('unexpected real core exit restores proxy and publishes an error', { skip: 
 
 test('failed restore after connection retains guardian and blocks switching nodes', { skip: !hasCore }, async () => {
   const network = await localNetwork()
-  const context = instance({ probeUrls: [network.probeUrl] })
+  const context = await instance({ probeUrls: [network.probeUrl] })
   try {
     assert.equal((await context.manager.connect({ uri: network.uri })).ok, true)
     context.proxy.failRestore = true
@@ -336,11 +338,49 @@ test('failed restore after connection retains guardian and blocks switching node
 
 test('API authentication is enforced by the real core', { skip: !hasCore }, async () => {
   const network = await localNetwork()
-  const context = instance({ probeUrls: [network.probeUrl] })
+  const context = await instance({ probeUrls: [network.probeUrl] })
   try {
     assert.equal((await context.manager.connect({ uri: network.uri })).ok, true)
     await assert.rejects(controller(context.manager.api.port, 'wrong-secret', '/version'), /未成功/)
     const response = await controller(context.manager.api.port, context.manager.api.secret, '/version')
     assert.ok(response.version)
   } finally { await context.cleanup(); await network.close() }
+})
+
+test('production proxy port defaults to 10808 and invalid overrides are rejected', async () => {
+  const context = await instance({ proxyPort: undefined })
+  try {
+    assert.equal(context.manager.status().port, 10808)
+    assert.equal(context.manager.proxyPort, 10808)
+    for (const value of [0, -1, 65536, 1.5, '10808']) {
+      assert.throws(() => new CoreManager({ proxyPort: value }), /代理端口/)
+    }
+  } finally { await context.cleanup() }
+})
+
+test('occupied configured proxy port is reported without spawning or taking over another process', { skip: !hasCore }, async () => {
+  const occupied = net.createServer((socket) => socket.end('other service'))
+  const proxyPort = await listen(occupied)
+  const context = await instance({ proxyPort })
+  try {
+    const response = await context.manager.connect({ uri: 'http://127.0.0.1:1' })
+    assert.equal(response.ok, false)
+    assert.match(response.message, new RegExp(String(proxyPort)))
+    assert.match(response.message, /被占用/)
+    assert.equal(context.manager.status().port, proxyPort)
+    assert.deepEqual(context.proxy.enabledPorts, [])
+    assert.deepEqual(context.spawns, [])
+    assert.deepEqual(fs.readdirSync(context.directory), [])
+    const originalService = await new Promise((resolve, reject) => {
+      let data = ''
+      const socket = net.connect({ host: '127.0.0.1', port: proxyPort })
+      socket.on('data', (chunk) => { data += chunk })
+      socket.on('end', () => resolve(data))
+      socket.on('error', reject)
+    })
+    assert.equal(originalService, 'other service')
+  } finally {
+    await context.cleanup()
+    await new Promise((resolve) => occupied.close(resolve))
+  }
 })

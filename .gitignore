@@ -6,7 +6,7 @@ test-artifacts/
 artifacts/
 server/data/users.json
 .env
-data/users.json
+data/
 tmp-server-test/
 core/
 electron/private-node.cjs

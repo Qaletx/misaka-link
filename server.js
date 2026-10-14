@@ -34,12 +34,18 @@ const ROOT_PASSWORD = process.env.MISAKA_ROOT_PASSWORD
 const CORS_ORIGINS = (process.env.MISAKA_CORS_ORIGIN || 'null').split(',').map(value => value.trim())
 const DATA_DIR = path.join(__dirname, 'data')
 const USERS_FILE = path.join(DATA_DIR, 'users.json')
+const STATE_FILE = path.join(DATA_DIR, 'state.json')
+const PRIVATE_NODE_URI = process.env.MISAKA_PRIVATE_NODE_URI || ''
+const ROLES = new Set(['admin', 'user', 'shared'])
+const NODE_SCHEMES = new Set(['hysteria2', 'tuic', 'trojan', 'vless', 'vmess', 'ss', 'socks5', 'http', 'https'])
+const MAX_PERSONAL_NODES = 200
 const MAX_BODY_BYTES = 64 * 1024
 const SESSION_MS = 7 * 24 * 60 * 60 * 1000
 const RATE_WINDOW_MS = 10 * 60 * 1000
 const MAX_RATE_ENTRIES = 10000
 const MAX_SESSIONS = 10000
 const MAX_USER_SESSIONS = 10
+const MAX_SHARED_SESSIONS = 200
 
 function normalizeAddress(address) { return address.startsWith('::ffff:') ? address.slice(7) : address }
 const TRUSTED_PROXIES = new Set((process.env.MISAKA_TRUSTED_PROXIES || '').split(',')
@@ -94,9 +100,30 @@ function parseExpiry(value) {
   return date.toISOString()
 }
 
+function nodeUri(value) {
+  if (typeof value !== 'string' || value.length > 16384 || /[\s\u0000-\u001f]/.test(value.trim())) throw new HttpError(400, '节点链接格式无效或过长')
+  const uri = value.trim().replace(/^hy2:\/\//i, 'hysteria2://')
+  const match = uri.match(/^([a-z0-9]+):\/\/([^#]+)(?:#.*)?$/i)
+  if (!match || !NODE_SCHEMES.has(match[1].toLowerCase())) throw new HttpError(400, '不支持此节点协议')
+  return { uri, protocol: match[1].toLowerCase(), key: uri.replace(/#.*$/, '').replace(/^[a-z0-9]+:/i, match[1].toLowerCase() + ':') }
+}
+function nodeText(value, field, maximum, fallback = '') {
+  if (value === undefined) return fallback
+  if (typeof value !== 'string' || value.length > maximum || /[\u0000-\u001f\u007f]/.test(value)) throw new HttpError(400, field + '格式无效或过长')
+  return value.trim()
+}
+function nodeLabel(uri) {
+  try { return decodeURIComponent(uri.split('#').slice(1).join('#')).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 100) || '未命名线路' } catch { return '未命名线路' }
+}
+function newNode(uri, owner, metadata = {}, id = crypto.randomUUID()) {
+  const parsed = nodeUri(uri)
+  return { id, owner, private: owner === null, uri: parsed.uri, protocol: parsed.protocol,
+    name: nodeText(metadata.name, '线路名称', 100, nodeLabel(parsed.uri)) || '未命名线路',
+    note: nodeText(metadata.note, '线路备注', 500), revision: 1, updatedAt: new Date().toISOString() }
+}
 fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 })
-function saveUsers(value) {
-  const temporary = path.join(DATA_DIR, '.users-' + process.pid + '-' + crypto.randomBytes(8).toString('hex') + '.tmp')
+function saveState(value) {
+  const temporary = path.join(DATA_DIR, '.state-' + process.pid + '-' + crypto.randomBytes(8).toString('hex') + '.tmp')
   let descriptor
   try {
     descriptor = fs.openSync(temporary, 'wx', 0o600)
@@ -104,47 +131,72 @@ function saveUsers(value) {
     fs.fsyncSync(descriptor)
     fs.closeSync(descriptor)
     descriptor = undefined
-    fs.renameSync(temporary, USERS_FILE)
+    fs.renameSync(temporary, STATE_FILE)
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor)
     if (fs.existsSync(temporary)) fs.unlinkSync(temporary)
   }
 }
-function seedUsers() {
-  if (fs.existsSync(USERS_FILE)) {
-    const value = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'))
-    if (!Array.isArray(value)) throw new Error('data/users.json 格式无效，请从备份恢复，勿删除用户数据')
-    const names = new Set()
-    for (const user of value) {
-      if (!user || typeof user.username !== 'string' || !/^[a-z][a-z0-9_-]{2,31}$/.test(user.username)
-        || names.has(user.username) || user.role !== (user.username === 'root' ? 'root' : 'user')
-        || typeof user.hash !== 'string' || !/^[a-f0-9]{128}$/.test(user.hash)
-        || typeof user.salt !== 'string' || !/^[a-f0-9]{32}$/.test(user.salt)
-        || (user.disabled !== undefined && typeof user.disabled !== 'boolean')) {
-        throw new Error('data/users.json 用户记录无效，请从备份恢复')
-      }
-      names.add(user.username)
-      user.disabled = user.disabled === true
-      user.expiresAt = user.expiresAt == null ? null : parseExpiry(user.expiresAt)
-      if (user.role === 'root' && (user.disabled || user.expiresAt)) throw new Error('root 账号不可禁用或设置有效期')
-    }
-    if (!names.has('root')) throw new Error('data/users.json 缺少 root 账号，请从备份恢复')
-    return value
+function validateUsers(value, legacy = false) {
+  if (!Array.isArray(value)) throw new Error('用户数据库格式无效，请从备份恢复，勿删除用户数据')
+  const names = new Set()
+  for (const user of value) {
+    if (legacy && user?.username === 'root' && user.role === 'root') user.role = 'admin'
+    if (!user || typeof user.username !== 'string' || !/^[a-z][a-z0-9_-]{2,31}$/.test(user.username)
+      || names.has(user.username) || !ROLES.has(user.role)
+      || typeof user.hash !== 'string' || !/^[a-f0-9]{128}$/.test(user.hash)
+      || typeof user.salt !== 'string' || !/^[a-f0-9]{32}$/.test(user.salt)
+      || (user.disabled !== undefined && typeof user.disabled !== 'boolean')) throw new Error('用户数据库记录无效，请从备份恢复')
+    names.add(user.username)
+    user.disabled = user.disabled === true
+    user.expiresAt = user.expiresAt == null ? null : parseExpiry(user.expiresAt)
+    if (legacy) { user.privateNodeAccess = true; user.privateNodeIds = ['misaka'] }
+    if (typeof user.privateNodeAccess !== 'boolean' || !Array.isArray(user.privateNodeIds)
+      || user.privateNodeIds.some(id => typeof id !== 'string' || id.length > 128)) throw new Error('用户节点权限记录无效，请从备份恢复')
+    if (user.username === 'root' && (user.role !== 'admin' || user.disabled || user.expiresAt)) throw new Error('root 账号不可降权、禁用或设置有效期')
   }
-  if (!passwordValid(USER_PASSWORD) || !passwordValid(ROOT_PASSWORD)
-    || USER_PASSWORD.includes('请替换') || ROOT_PASSWORD.includes('请替换')) {
-    throw new Error('首次启动请在 .env 设置 MISAKA_USER_PASSWORD 和 MISAKA_ROOT_PASSWORD（8-256 位）')
-  }
-  const now = new Date().toISOString()
-  const value = [
-    { username: 'root', role: 'root', ...hashPassword(ROOT_PASSWORD), disabled: false, expiresAt: null, createdAt: now, updatedAt: now },
-    { username: 'user', role: 'user', ...hashPassword(USER_PASSWORD), disabled: false, expiresAt: null, createdAt: now, updatedAt: now }
-  ]
-  saveUsers(value)
+  if (!names.has('root')) throw new Error('用户数据库缺少 root 账号，请从备份恢复')
   return value
 }
-let users = seedUsers()
-function persistUsers(next) { saveUsers(next); users = next }
+function seedState() {
+  if (fs.existsSync(STATE_FILE)) {
+    const value = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))
+    if (!value || value.schemaVersion !== 2 || !Array.isArray(value.nodes) || !Array.isArray(value.annotations)) throw new Error('data/state.json 格式无效，请从备份恢复')
+    validateUsers(value.users)
+    const ids = new Set()
+    for (const node of value.nodes) {
+      if (!node || typeof node.id !== 'string' || ids.has(node.id) || typeof node.private !== 'boolean'
+        || (node.private ? node.owner !== null : !value.users.some(user => user.username === node.owner))
+        || !Number.isSafeInteger(node.revision) || node.revision < 1) throw new Error('数据库线路记录无效，请从备份恢复')
+      nodeUri(node.uri); nodeText(node.name, '线路名称', 100); nodeText(node.note, '线路备注', 500)
+      ids.add(node.id)
+    }
+    for (const item of value.annotations) {
+      if (!item || typeof item.username !== 'string' || !value.users.some(user => user.username === item.username)
+        || !value.nodes.some(node => node.id === item.nodeId && node.private)) throw new Error('数据库备注记录无效，请从备份恢复')
+      nodeText(item.name, '线路名称', 100); nodeText(item.note, '线路备注', 500)
+    }
+    return value
+  }
+  let seededUsers
+  if (fs.existsSync(USERS_FILE)) seededUsers = validateUsers(JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')), true)
+  else {
+    if (!passwordValid(USER_PASSWORD) || !passwordValid(ROOT_PASSWORD)
+      || USER_PASSWORD.includes('请替换') || ROOT_PASSWORD.includes('请替换')) throw new Error('首次启动请在 .env 设置 MISAKA_USER_PASSWORD 和 MISAKA_ROOT_PASSWORD（8-256 位）')
+    const now = new Date().toISOString()
+    seededUsers = [
+      { username: 'root', role: 'admin', ...hashPassword(ROOT_PASSWORD), privateNodeAccess: true, privateNodeIds: ['misaka'], disabled: false, expiresAt: null, createdAt: now, updatedAt: now },
+      { username: 'user', role: 'user', ...hashPassword(USER_PASSWORD), privateNodeAccess: false, privateNodeIds: [], disabled: false, expiresAt: null, createdAt: now, updatedAt: now }
+    ]
+  }
+  const value = { schemaVersion: 2, users: seededUsers, nodes: PRIVATE_NODE_URI ? [newNode(PRIVATE_NODE_URI, null, { name: '默认专属线路' }, 'misaka')] : [], annotations: [] }
+  saveState(value)
+  return value
+}
+let state = seedState()
+let users = state.users
+function persistState(next) { saveState(next); state = next; users = state.users }
+function persistUsers(next) { persistState({ ...state, users: next }) }
 const dummyPassword = hashPassword(crypto.randomBytes(32).toString('hex'))
 const sessions = new Map()
 const loginAttempts = new Map()
@@ -193,12 +245,13 @@ function revokeUserSessions(username) {
   for (const [token, session] of sessions) if (session.username === username) sessions.delete(token)
 }
 function safeUser(user) {
-  return { username: user.username, role: user.role, disabled: user.disabled === true, expiresAt: user.expiresAt || null, createdAt: user.createdAt, updatedAt: user.updatedAt }
+  return { username: user.username, role: user.role, isRoot: user.username === 'root', privateNodeAccess: user.privateNodeAccess, privateNodeIds: [...user.privateNodeIds], disabled: user.disabled === true, expiresAt: user.expiresAt || null, createdAt: user.createdAt, updatedAt: user.updatedAt, permissions: { manageUsers: user.role === 'admin', managePrivateNodes: user.username === 'root', changePassword: user.role !== 'shared', syncNodes: user.role !== 'shared' } }
 }
 function issueToken(username) {
   pruneSessions()
   const owned = [...sessions].filter(([, session]) => session.username === username)
-  while (owned.length >= MAX_USER_SESSIONS) sessions.delete(owned.shift()[0])
+  const limit = users.find(user => user.username === username)?.role === 'shared' ? MAX_SHARED_SESSIONS : MAX_USER_SESSIONS
+  while (owned.length >= limit) sessions.delete(owned.shift()[0])
   if (sessions.size >= MAX_SESSIONS) throw new HttpError(503, '登录会话已达上限，请稍后再试')
   const token = crypto.createHmac('sha256', TOKEN_SECRET).update(crypto.randomBytes(32)).digest('base64url')
   sessions.set(token, { username, expiresAt: Date.now() + SESSION_MS })
@@ -265,12 +318,75 @@ function readBody(req) {
 function decodeName(value) {
   try { return decodeURIComponent(value) } catch { throw new HttpError(400, '用户路径编码无效') }
 }
-function requireRoot(actor) { if (actor.role !== 'root') throw new HttpError(403, '没有权限') }
+function requireRoot(actor) { if (actor.username !== 'root') throw new HttpError(403, '仅 root 可以执行此操作') }
+function requireAdmin(actor) { if (actor.role !== 'admin') throw new HttpError(403, '没有管理权限') }
+function requirePersonal(actor) { if (actor.role === 'shared') throw new HttpError(403, '共用账号不支持个人线路云同步') }
+function manageable(actor, target) {
+  requireAdmin(actor)
+  if (actor.username !== 'root' && target.role === 'admin') throw new HttpError(403, '管理员不能修改其他管理员或 root')
+}
 // Request bodies arrive asynchronously. Re-check the session before any mutation.
 function requireCurrentActor(req) {
   const actor = authenticate(req)
   if (!actor) throw new HttpError(401, '登录已过期或账号不可用，请重新登录')
   return actor
+}
+
+function onlyFields(body, allowed, required = false) {
+  const keys = Object.keys(body)
+  if ((required && !keys.length) || keys.some(key => !allowed.includes(key))) throw new HttpError(400, '请求包含不支持的字段或缺少修改内容')
+}
+function userChanges(body, actor, record) {
+  const updated = { ...record }
+  if ('role' in body) {
+    if (!ROLES.has(body.role)) throw new HttpError(400, '角色必须是 admin、user 或 shared')
+    if (actor.username !== 'root' && body.role === 'admin') throw new HttpError(403, '仅 root 可以创建或设置管理员')
+    updated.role = body.role
+  }
+  if ('disabled' in body) {
+    if (typeof body.disabled !== 'boolean') throw new HttpError(400, 'disabled 必须为 true 或 false')
+    updated.disabled = body.disabled
+  }
+  if ('expiresAt' in body) updated.expiresAt = parseExpiry(body.expiresAt)
+  if ('privateNodeAccess' in body || 'privateNodeIds' in body) {
+    requireRoot(actor)
+    if ('privateNodeAccess' in body) {
+      if (typeof body.privateNodeAccess !== 'boolean') throw new HttpError(400, 'privateNodeAccess 必须为 true 或 false')
+      updated.privateNodeAccess = body.privateNodeAccess
+    }
+    if ('privateNodeIds' in body) {
+      if (!Array.isArray(body.privateNodeIds) || body.privateNodeIds.length > 200 || body.privateNodeIds.some(id => typeof id !== 'string'
+        || !state.nodes.some(node => node.id === id && node.private))) throw new HttpError(400, 'privateNodeIds 必须仅包含存在的私有线路 ID')
+      updated.privateNodeIds = [...new Set(body.privateNodeIds)]
+    }
+  }
+  if (updated.username === 'root' && (updated.role !== 'admin' || updated.disabled || updated.expiresAt !== null || !updated.privateNodeAccess)) throw new HttpError(400, 'root 账号不可降权、停用、设置到期或关闭私有线路权限')
+  updated.updatedAt = new Date().toISOString()
+  return updated
+}
+function allowedNode(actor, node) {
+  return node.private ? actor.username === 'root' || (actor.privateNodeAccess && actor.privateNodeIds.includes(node.id)) : actor.role !== 'shared' && node.owner === actor.username
+}
+function findNode(actor, id) {
+  const node = state.nodes.find(item => item.id === id)
+  if (!node) throw new HttpError(404, '线路不存在')
+  if (!allowedNode(actor, node)) throw new HttpError(403, '未获授权使用此线路')
+  return node
+}
+function safeNode(actor, node) {
+  const annotation = state.annotations.find(item => item.username === actor.username && item.nodeId === node.id)
+  return { id: node.id, name: annotation?.name || node.name, note: annotation && annotation.note !== undefined ? annotation.note : node.note,
+    protocol: node.protocol, private: node.private, ...(!node.private ? { uri: node.uri } : {}), updatedAt: annotation?.updatedAt || node.updatedAt, revision: node.revision }
+}
+function checkRevision(body, node) {
+  if (!Number.isSafeInteger(body.revision) || body.revision < 1) throw new HttpError(400, '修改线路必须提供 revision')
+  if (body.revision !== node.revision) throw new HttpError(409, '线路已在其他设备更新，请刷新后再保存')
+}
+function updateNode(node, body) {
+  onlyFields(body, ['name', 'note', 'revision'])
+  if (!('name' in body) && !('note' in body)) throw new HttpError(400, '请提供线路名称或备注')
+  checkRevision(body, node)
+  return { ...node, name: nodeText(body.name, '线路名称', 100, node.name) || '未命名线路', note: nodeText(body.note, '线路备注', 500, node.note), revision: node.revision + 1, updatedAt: new Date().toISOString() }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -303,81 +419,185 @@ const server = http.createServer(async (req, res) => {
     const actor = requireCurrentActor(req)
     if (req.method === 'GET' && url.pathname === '/api/me') return send(res, 200, { user: safeUser(actor) })
     if (req.method === 'POST' && url.pathname === '/api/me/password') {
+      if (actor.role === 'shared') throw new HttpError(403, '共用账号不能自行修改密码，请联系管理员')
       requireAttempt(req, 'password')
-      const { currentPassword, password } = await readBody(req)
+      const body = await readBody(req)
       const currentActor = requireCurrentActor(req)
-      requirePassword(currentPassword)
-      requirePassword(password)
-      if (!verifyPassword(currentPassword, currentActor)) throw new HttpError(400, '当前密码不正确')
-      const updated = { ...currentActor, ...hashPassword(password), updatedAt: new Date().toISOString() }
+      if (currentActor.role === 'shared') throw new HttpError(403, '共用账号不能自行修改密码，请联系管理员')
+      onlyFields(body, ['currentPassword', 'password'])
+      requirePassword(body.currentPassword); requirePassword(body.password)
+      if (!verifyPassword(body.currentPassword, currentActor)) throw new HttpError(400, '当前密码不正确')
+      const updated = { ...currentActor, ...hashPassword(body.password), updatedAt: new Date().toISOString() }
       persistUsers(users.map(user => user.username === currentActor.username ? updated : user))
       revokeUserSessions(currentActor.username)
       return send(res, 200, { ok: true, user: safeUser(updated), reLoginRequired: true })
     }
     if (req.method === 'GET' && url.pathname === '/api/users') {
-      requireRoot(actor)
-      return send(res, 200, { users: users.map(safeUser) })
+      requireAdmin(actor)
+      return send(res, 200, { users: users.filter(user => actor.username === 'root' || user.role !== 'admin').map(safeUser) })
     }
     if (req.method === 'GET' && url.pathname === '/api/stats') {
-      requireRoot(actor)
+      requireAdmin(actor)
       pruneSessions()
-      return send(res, 200, { userCount: users.length, activeSessions: sessions.size, uptime: process.uptime() })
+      const visible = users.filter(user => actor.username === 'root' || user.role !== 'admin')
+      return send(res, 200, { userCount: visible.length, activeSessions: [...sessions.values()].filter(session => visible.some(user => user.username === session.username)).length, uptime: process.uptime() })
     }
     if (req.method === 'POST' && url.pathname === '/api/users') {
-      requireRoot(actor)
-      const { username, password } = await readBody(req)
-      requireRoot(requireCurrentActor(req))
-      if (typeof username !== 'string') throw new HttpError(400, '账号必须是字符串')
-      const cleanName = username.trim().toLowerCase()
+      requireAdmin(actor)
+      const body = await readBody(req)
+      const currentActor = requireCurrentActor(req)
+      requireAdmin(currentActor)
+      onlyFields(body, ['username', 'password', 'role', 'disabled', 'expiresAt', 'privateNodeAccess', 'privateNodeIds'])
+      if (typeof body.username !== 'string') throw new HttpError(400, '账号必须是字符串')
+      const cleanName = body.username.trim().toLowerCase()
       if (!/^[a-z][a-z0-9_-]{2,31}$/.test(cleanName) || cleanName === 'root') throw new HttpError(400, '账号需以字母开头，为 3-32 位字母、数字、下划线或短横线')
       if (users.some(item => item.username === cleanName)) throw new HttpError(409, '账号已存在')
-      requirePassword(password)
+      requirePassword(body.password)
       const now = new Date().toISOString()
-      const record = { username: cleanName, role: 'user', ...hashPassword(password), disabled: false, expiresAt: null, createdAt: now, updatedAt: now }
+      const record = userChanges(body, currentActor, { username: cleanName, role: 'user', ...hashPassword(body.password), privateNodeAccess: false, privateNodeIds: [], disabled: false, expiresAt: null, createdAt: now, updatedAt: now })
       persistUsers([...users, record])
       return send(res, 201, { user: safeUser(record) })
     }
     const passwordMatch = url.pathname.match(/^\/api\/users\/([^/]+)\/password$/)
     if (req.method === 'PATCH' && passwordMatch) {
-      requireRoot(actor)
+      requireAdmin(actor)
       const target = decodeName(passwordMatch[1])
-      const { password } = await readBody(req)
-      requireRoot(requireCurrentActor(req))
-      requirePassword(password)
+      const body = await readBody(req)
+      const currentActor = requireCurrentActor(req)
+      requireAdmin(currentActor)
+      onlyFields(body, ['password'])
+      requirePassword(body.password)
       const record = users.find(item => item.username === target)
       if (!record) throw new HttpError(404, '用户不存在')
-      const updated = { ...record, ...hashPassword(password), updatedAt: new Date().toISOString() }
+      manageable(currentActor, record)
+      const updated = { ...record, ...hashPassword(body.password), updatedAt: new Date().toISOString() }
       persistUsers(users.map(user => user.username === target ? updated : user))
       revokeUserSessions(target)
       return send(res, 200, { ok: true, user: safeUser(updated) })
     }
     const userMatch = url.pathname.match(/^\/api\/users\/([^/]+)$/)
     if (req.method === 'PATCH' && userMatch) {
-      requireRoot(actor)
+      requireAdmin(actor)
       const target = decodeName(userMatch[1])
       const body = await readBody(req)
-      requireRoot(requireCurrentActor(req))
-      const keys = Object.keys(body)
-      if (!keys.length || keys.some(key => key !== 'disabled' && key !== 'expiresAt')) throw new HttpError(400, '仅支持 disabled 和 expiresAt 字段')
-      if ('disabled' in body && typeof body.disabled !== 'boolean') throw new HttpError(400, 'disabled 必须为 true 或 false')
+      const currentActor = requireCurrentActor(req)
+      requireAdmin(currentActor)
+      onlyFields(body, ['role', 'disabled', 'expiresAt', 'privateNodeAccess', 'privateNodeIds'], true)
       const record = users.find(item => item.username === target)
       if (!record) throw new HttpError(404, '用户不存在')
-      const updated = { ...record, updatedAt: new Date().toISOString() }
-      if ('disabled' in body) updated.disabled = body.disabled
-      if ('expiresAt' in body) updated.expiresAt = parseExpiry(body.expiresAt)
-      if (target === 'root' && (updated.disabled || updated.expiresAt !== null)) throw new HttpError(400, 'root 账号不能停用或设置有效期')
+      manageable(currentActor, record)
+      const updated = userChanges(body, currentActor, record)
       persistUsers(users.map(user => user.username === target ? updated : user))
-      revokeUserSessions(target)
+      if (updated.role !== record.role || updated.disabled !== record.disabled || updated.expiresAt !== record.expiresAt) revokeUserSessions(target)
       return send(res, 200, { ok: true, user: safeUser(updated) })
     }
     if (req.method === 'DELETE' && userMatch) {
-      requireRoot(actor)
+      requireAdmin(actor)
       const target = decodeName(userMatch[1])
       if (target === 'root') throw new HttpError(400, 'root 账号不能删除')
-      if (!users.some(user => user.username === target)) throw new HttpError(404, '用户不存在')
-      persistUsers(users.filter(user => user.username !== target))
+      const record = users.find(user => user.username === target)
+      if (!record) throw new HttpError(404, '用户不存在')
+      manageable(actor, record)
+      persistState({ ...state, users: users.filter(user => user.username !== target), nodes: state.nodes.filter(node => node.owner !== target), annotations: state.annotations.filter(item => item.username !== target) })
       revokeUserSessions(target)
       return send(res, 200, { ok: true })
+    }
+    if (req.method === 'GET' && url.pathname === '/api/nodes') {
+      return send(res, 200, { nodes: state.nodes.filter(node => allowedNode(actor, node)).map(node => safeNode(actor, node)) })
+    }
+    const configMatch = url.pathname.match(/^\/api\/nodes\/([^/]+)\/config$/)
+    if (req.method === 'GET' && configMatch) {
+      const node = findNode(actor, decodeName(configMatch[1]))
+      const metadata = safeNode(actor, node)
+      delete metadata.uri
+      return send(res, 200, { uri: node.uri, node: metadata })
+    }
+    if (req.method === 'POST' && url.pathname === '/api/nodes') {
+      requirePersonal(actor)
+      const body = await readBody(req)
+      const currentActor = requireCurrentActor(req)
+      requirePersonal(currentActor)
+      onlyFields(body, ['uri', 'name', 'note'])
+      const created = newNode(body.uri, currentActor.username, body)
+      const existing = state.nodes.find(node => !node.private && node.owner === currentActor.username && nodeUri(node.uri).key === nodeUri(created.uri).key)
+      if (existing) return send(res, 200, { node: safeNode(currentActor, existing), existing: true })
+      if (state.nodes.filter(node => node.owner === currentActor.username).length >= MAX_PERSONAL_NODES) throw new HttpError(400, '每个账号最多同步 200 条个人线路')
+      persistState({ ...state, nodes: [...state.nodes, created] })
+      return send(res, 201, { node: safeNode(currentActor, created) })
+    }
+    const nodeMatch = url.pathname.match(/^\/api\/nodes\/([^/]+)$/)
+    if (req.method === 'PATCH' && nodeMatch) {
+      requirePersonal(actor)
+      const body = await readBody(req)
+      const currentActor = requireCurrentActor(req)
+      requirePersonal(currentActor)
+      const node = findNode(currentActor, decodeName(nodeMatch[1]))
+      if (node.private) throw new HttpError(403, '私有线路请使用备注接口；root 可通过专属接口管理')
+      const updated = updateNode(node, body)
+      persistState({ ...state, nodes: state.nodes.map(item => item.id === node.id ? updated : item) })
+      return send(res, 200, { node: safeNode(currentActor, updated) })
+    }
+    if (req.method === 'DELETE' && nodeMatch) {
+      requirePersonal(actor)
+      const node = findNode(actor, decodeName(nodeMatch[1]))
+      if (node.private) throw new HttpError(403, '只有 root 可以通过专属接口删除私有线路')
+      persistState({ ...state, nodes: state.nodes.filter(item => item.id !== node.id) })
+      return send(res, 200, { ok: true })
+    }
+    if (req.method === 'POST' && url.pathname === '/api/private-nodes') {
+      requireRoot(actor)
+      const body = await readBody(req)
+      const currentActor = requireCurrentActor(req)
+      requireRoot(currentActor)
+      onlyFields(body, ['sourceNodeId', 'uri', 'name', 'note'])
+      if (('sourceNodeId' in body) === ('uri' in body)) throw new HttpError(400, '请提供 sourceNodeId 或 uri，不能同时提供')
+      let source
+      if ('sourceNodeId' in body) {
+        source = state.nodes.find(node => node.id === body.sourceNodeId && !node.private && node.owner === currentActor.username)
+        if (!source) throw new HttpError(404, '只能将 root 自己的个人线路转为私有线路')
+      }
+      const created = source ? { ...source, owner: null, private: true,
+        name: nodeText(body.name, '线路名称', 100, source.name) || '未命名线路', note: nodeText(body.note, '线路备注', 500, source.note), revision: source.revision + 1, updatedAt: new Date().toISOString() } : newNode(body.uri, null, body)
+      const existing = state.nodes.find(node => node.private && nodeUri(node.uri).key === nodeUri(created.uri).key)
+      if (existing) throw new HttpError(409, '该私有线路已存在')
+      if (state.nodes.filter(node => node.private).length >= MAX_PERSONAL_NODES) throw new HttpError(400, '最多配置 200 条私有线路')
+      persistState({ ...state, nodes: [...state.nodes.filter(node => node.id !== source?.id), created] })
+      return send(res, 201, { node: safeNode(currentActor, created) })
+    }
+    const privateMatch = url.pathname.match(/^\/api\/private-nodes\/([^/]+)$/)
+    if (req.method === 'PATCH' && privateMatch) {
+      requireRoot(actor)
+      const body = await readBody(req)
+      const currentActor = requireCurrentActor(req)
+      requireRoot(currentActor)
+      const node = state.nodes.find(item => item.id === decodeName(privateMatch[1]) && item.private)
+      if (!node) throw new HttpError(404, '私有线路不存在')
+      const updated = updateNode(node, body)
+      persistState({ ...state, nodes: state.nodes.map(item => item.id === node.id ? updated : item) })
+      return send(res, 200, { node: safeNode(currentActor, updated) })
+    }
+    if (req.method === 'DELETE' && privateMatch) {
+      requireRoot(actor)
+      const id = decodeName(privateMatch[1])
+      if (!state.nodes.some(node => node.id === id && node.private)) throw new HttpError(404, '私有线路不存在')
+      persistState({ ...state, nodes: state.nodes.filter(node => node.id !== id), annotations: state.annotations.filter(item => item.nodeId !== id),
+        users: users.map(user => ({ ...user, privateNodeIds: user.privateNodeIds.filter(nodeId => nodeId !== id) })) })
+      return send(res, 200, { ok: true })
+    }
+    const annotationMatch = url.pathname.match(/^\/api\/node-annotations\/([^/]+)$/)
+    if (req.method === 'PATCH' && annotationMatch) {
+      requirePersonal(actor)
+      const body = await readBody(req)
+      const currentActor = requireCurrentActor(req)
+      requirePersonal(currentActor)
+      onlyFields(body, ['name', 'note'], true)
+      const node = findNode(currentActor, decodeName(annotationMatch[1]))
+      if (!node.private) throw new HttpError(400, '个人线路请直接编辑线路名称和备注')
+      const previous = state.annotations.find(item => item.username === currentActor.username && item.nodeId === node.id)
+      const annotation = { username: currentActor.username, nodeId: node.id,
+        name: nodeText(body.name, '线路名称', 100, previous?.name || ''), note: nodeText(body.note, '线路备注', 500, previous?.note ?? node.note), updatedAt: new Date().toISOString() }
+      persistState({ ...state, annotations: [...state.annotations.filter(item => item.username !== currentActor.username || item.nodeId !== node.id), annotation] })
+      return send(res, 200, { node: safeNode(currentActor, node) })
     }
     throw new HttpError(404, '接口不存在')
   } catch (error) {

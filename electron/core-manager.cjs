@@ -17,9 +17,23 @@ function freePort() {
     server.listen(0,'127.0.0.1',()=>{ const port=server.address().port; server.close(()=>resolve(port)) })
   })
 }
-function controller(port,secret,route,timeout=2500) {
+function reservePort(port) {
   return new Promise((resolve,reject)=>{
-    const request=http.get({host:'127.0.0.1',port,path:route,headers:{Authorization:`Bearer ${secret}`},timeout},res=>{
+    const server=net.createServer()
+    server.once('error',()=>reject(new Error(`本地代理端口 ${port} 已被占用或无法使用，请关闭占用该端口的软件后重试`)))
+    server.listen({port,host:'127.0.0.1',exclusive:true},()=>{
+      let released=false
+      resolve(()=>new Promise(done=>{
+        if(released) return done()
+        released=true
+        server.close(done)
+      }))
+    })
+  })
+}
+function controller(port,secret,route,timeout=2500,signal) {
+  return new Promise((resolve,reject)=>{
+    const request=http.get({host:'127.0.0.1',port,path:route,headers:{Authorization:`Bearer ${secret}`},timeout,signal},res=>{
       let body=''
       res.on('data',chunk=>{body+=chunk; if(body.length>1048576) request.destroy(new Error('核心响应过大'))})
       res.on('end',()=>{
@@ -32,13 +46,13 @@ function controller(port,secret,route,timeout=2500) {
     request.on('error',reject)
   })
 }
-function httpProbe(port,url,timeout=7000) {
+function httpProbe(port,url,timeout=7000,signal) {
   // sing-box's delay API replaces plain HTTP URLs with its public HTTPS default.
   // Explicit HTTP probes instead traverse the mixed inbound (global mode only),
   // which also permits isolated local integration checks without internet access.
   const target=new URL(url)
   return new Promise((resolve,reject)=>{
-    const request=http.get({host:'127.0.0.1',port,path:target.href,headers:{Host:target.host},agent:false,timeout},res=>{
+    const request=http.get({host:'127.0.0.1',port,path:target.href,headers:{Host:target.host},agent:false,timeout,signal},res=>{
       res.on('error',reject)
       res.resume()
       if(res.statusCode>=200 && res.statusCode<300) resolve()
@@ -52,9 +66,11 @@ class CoreManager extends EventEmitter {
   constructor(options) {
     super()
     Object.assign(this,{binary:options.binary,directory:options.directory,proxy:options.proxy,onSpawn:options.onSpawn||(()=>null)})
+    this.proxyPort=options.proxyPort===undefined?10808:options.proxyPort
+    if(!Number.isInteger(this.proxyPort)||this.proxyPort<1||this.proxyPort>65535) throw new Error('本地代理端口必须为 1–65535 之间的整数')
     this.probeUrls=options.probeUrls||['https://www.gstatic.com/generate_204','https://www.apple.com/library/test/success.html']
     this.queue=Promise.resolve(); this.child=null; this.logs=[]; this.timer=null; this.guardian=null; this.cancel=false; this.cancelEpoch=0
-    this.state={phase:'idle',connected:false,nodeId:null,name:'',startedAt:null,up:0,down:0,error:'',systemProxy:false,mode:'global'}
+    this.state={phase:'idle',connected:false,nodeId:null,name:'',startedAt:null,up:0,down:0,error:'',systemProxy:false,mode:'global',port:this.proxyPort}
   }
   status() { return {...this.state} }
   update(patch) { Object.assign(this.state,patch); this.emit('status',this.status()) }
@@ -77,10 +93,12 @@ class CoreManager extends EventEmitter {
     if(epoch!==this.cancelEpoch) return {ok:false,message:'连接已取消'}
     this.cancel=false
     this.update({phase:'connecting',connected:false,error:'',nodeId:payload.id||payload.privateId||null,name:payload.name||'节点',up:0,down:0,startedAt:null,mode:payload.mode||'global'})
-    let configPath
+    let configPath,releasePort
     try {
       if(!this.binary || !fs.existsSync(this.binary)) throw new Error('安装包缺少代理核心，请重新安装完整版本')
-      const port=await freePort(); let apiPort=await freePort()
+      const port=this.proxyPort
+      releasePort=await reservePort(port)
+      let apiPort=await freePort()
       while(apiPort===port) apiPort=await freePort()
       const secret=crypto.randomBytes(32).toString('hex')
       this.api={port:apiPort,secret}
@@ -92,6 +110,7 @@ class CoreManager extends EventEmitter {
       catch { throw new Error('节点配置未通过核心校验，请检查协议和链接参数') }
       if(this.cancel) throw new Error('连接已取消')
       this.spawnFailed=false
+      await releasePort(); releasePort=null
       const child=spawn(this.binary,['run','-c',configPath],{windowsHide:true,stdio:['ignore','ignore','pipe']})
       this.child=child
       // Do not forward raw core errors: they can contain node addresses and credentials.
@@ -159,6 +178,7 @@ class CoreManager extends EventEmitter {
       this.log('error',this.state.error)
       return {ok:false,message:this.state.error}
     } finally {
+      if(releasePort) await releasePort()
       if(configPath) try { fs.unlinkSync(configPath) } catch {}
     }
   }
@@ -181,4 +201,4 @@ class CoreManager extends EventEmitter {
     return {ok:!restoreError,message:restoreError||'已断开连接'}
   }
 }
-module.exports={CoreManager,controller,freePort}
+module.exports={CoreManager,controller,freePort,httpProbe}
