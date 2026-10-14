@@ -5,11 +5,12 @@ const crypto = require('crypto')
 
 const HOST = process.env.MISAKA_HOST || '0.0.0.0'
 const PORT = Number(process.env.MISAKA_PORT || 8787)
-const TOKEN_SECRET = process.env.MISAKA_TOKEN_SECRET || 'change-this-secret-before-production'
+const TOKEN_SECRET = process.env.MISAKA_TOKEN_SECRET
 const DATA_DIR = path.join(__dirname, 'data')
 const USERS_FILE = path.join(DATA_DIR, 'users.json')
 const DEFAULT_USER_PASSWORD = process.env.MISAKA_USER_PASSWORD
 const DEFAULT_ROOT_PASSWORD = process.env.MISAKA_ROOT_PASSWORD
+if (!TOKEN_SECRET) throw new Error('Set MISAKA_TOKEN_SECRET before starting')
 const sessions = new Map()
 
 fs.mkdirSync(DATA_DIR, { recursive: true })
@@ -23,6 +24,7 @@ function verifyPassword(password, user) {
 }
 function seedUsers() {
   if (fs.existsSync(USERS_FILE)) return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'))
+  if (!TOKEN_SECRET) throw new Error('Set MISAKA_TOKEN_SECRET before first start')
   if (!DEFAULT_USER_PASSWORD || !DEFAULT_ROOT_PASSWORD) throw new Error('Set MISAKA_USER_PASSWORD and MISAKA_ROOT_PASSWORD before first start')
   const now = new Date().toISOString()
   const root = hashPassword(DEFAULT_ROOT_PASSWORD)
@@ -141,4 +143,5 @@ const server = http.createServer(async (req, res) => {
   }
 })
 server.listen(PORT, HOST, () => console.log(`qaletx link server listening on http://${HOST}:${PORT}`))
+
 
