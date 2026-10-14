@@ -77,6 +77,7 @@
       "category": "public.app-category.utilities",
       "artifactName": "qaletx-link-${version}-${arch}.${ext}",
       "icon": "assets/qaletx-link.png",
+      "x64ArchFiles": "Contents/Resources/core/sing-box-*",
       "extraResources": [
         {
           "from": "core",
