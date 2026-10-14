@@ -83,10 +83,29 @@ class CoreManager extends EventEmitter {
     if(!Number.isInteger(this.proxyPort)||this.proxyPort<1||this.proxyPort>65535) throw new Error('本地代理端口必须为 1–65535 之间的整数')
     this.probeUrls=options.probeUrls||['https://www.gstatic.com/generate_204','https://www.apple.com/library/test/success.html']
     this.queue=Promise.resolve(); this.child=null; this.logs=[]; this.timer=null; this.guardian=null; this.cancel=false; this.cancelEpoch=0; this.connectionAbort=null
-    this.state={phase:'idle',stage:'',connected:false,nodeId:null,name:'',startedAt:null,up:0,down:0,error:'',systemProxy:false,mode:'global',port:this.proxyPort}
+    this.state={phase:'idle',stage:'',stageStartedAt:null,timings:[],connected:false,nodeId:null,name:'',startedAt:null,up:0,down:0,error:'',errorCode:'',systemProxy:false,mode:'global',port:this.proxyPort}
   }
   status() { return {...this.state} }
-  update(patch) { Object.assign(this.state,patch); this.emit('status',this.status()) }
+  update(patch) {
+    if('stage' in patch && patch.stage!==this.state.stage) {
+      const now=Date.now()
+      if(this.state.stage&&this.state.stageStartedAt) this.state.timings=[...this.state.timings,{stage:this.state.stage,durationMs:Math.max(0,now-this.state.stageStartedAt)}].slice(-12)
+      patch.stageStartedAt=patch.stage?now:null
+    }
+    Object.assign(this.state,patch); this.emit('status',this.status())
+  }
+  async checkHealth(signal) {
+    if(!this.state.connected||!this.api) return {ok:false}
+    for(const url of this.probeUrls) {
+      if(signal?.aborted) return {ok:false}
+      try {
+        if(url.startsWith('http://')) await httpProbe(this.proxyPort,url,5000,signal)
+        else {const result=await controller(this.api.port,this.api.secret,`/proxies/proxy/delay?url=${encodeURIComponent(url)}&timeout=5000`,5500,signal);if(!Number.isFinite(result.delay)||result.delay<0)throw new Error('连通性响应无效')}
+        return {ok:true,checkedAt:Date.now()}
+      } catch { if(signal?.aborted) return {ok:false} }
+    }
+    return {ok:false,checkedAt:Date.now()}
+  }
   log(level,message) { this.logs.push({time:new Date().toISOString(),level,message}); if(this.logs.length>150) this.logs.shift() }
   serial(operation) { const result=this.queue.then(operation,operation); this.queue=result.catch(()=>{}); return result }
   connect(payload) {
@@ -140,7 +159,7 @@ class CoreManager extends EventEmitter {
         this.serial(async()=>{
           if(this.child!==child) return
           await this.stop(false)
-          this.update({phase:'error',error:'代理核心意外退出，已尝试恢复系统代理'})
+          this.update({phase:'error',error:'代理核心意外退出，已尝试恢复系统代理',errorCode:'CORE_EXIT'})
           this.log('error','代理核心意外退出')
         }).catch(()=>{})
       })
@@ -187,7 +206,7 @@ class CoreManager extends EventEmitter {
           if(++failures>=3 && this.child===child) this.serial(async()=>{
             if(this.child!==child) return
             await this.stop(false)
-            this.update({phase:'error',error:'代理核心失去响应，已尝试恢复系统代理'})
+            this.update({phase:'error',error:'代理核心失去响应，已尝试恢复系统代理',errorCode:'CORE_UNRESPONSIVE'})
           }).catch(()=>{})
         } finally { polling=false }
       },1500)

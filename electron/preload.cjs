@@ -11,6 +11,14 @@ contextBridge.exposeInMainWorld('misaka',{
   connect:payload=>ipcRenderer.invoke('core:connect',payload),
   disconnect:()=>ipcRenderer.invoke('core:disconnect'),
   quit:()=>ipcRenderer.invoke('app:quit'),
+  getPreferences:()=>ipcRenderer.invoke('app:get-preferences'),
+  setPreferences:patch=>ipcRenderer.invoke('app:set-preferences',patch),
+  setSelection:payload=>ipcRenderer.invoke('app:set-selection',payload),
+  setCatalog:nodes=>ipcRenderer.invoke('app:set-catalog',nodes),
+  diagnose:()=>ipcRenderer.invoke('app:diagnostics'),
+  diagnosticReport:()=>ipcRenderer.invoke('app:diagnostic-report'),
+  onSelection:callback=>{const listener=(_event,id)=>callback(id);ipcRenderer.on('app:selection',listener);return()=>ipcRenderer.removeListener('app:selection',listener)},
+  onDiagnostics:callback=>{const listener=()=>callback();ipcRenderer.on('app:open-diagnostics',listener);return()=>ipcRenderer.removeListener('app:open-diagnostics',listener)},
   onStatus:callback=>{
     const listener=(_event,state)=>callback(state)
     ipcRenderer.on('core:status',listener)

@@ -7,19 +7,25 @@ class AccountSession {
   constructor({timeout=10000}={}) {this.timeout=timeout;this.current=null;this.epoch=0;this.requests=new Set()}
   clear() {
     this.epoch++;this.current=null
-    for(const request of this.requests) request.destroy(new AccountError('账号会话已切换'))
+    this.cancelRequests('账号会话已切换')
+  }
+  cancelRequests(message='操作已取消') {
+    for(const request of this.requests) request.destroy(new AccountError(message))
     this.requests.clear()
   }
-  async request(credentials,route) {
+  async request(credentials,route,signal) {
     const target=new URL(route,credentials.apiUrl)
     return new Promise((resolve,reject)=>{
-      const request=(target.protocol==='https:'?https:http).get(target,{headers:{Authorization:`Bearer ${credentials.token}`,Accept:'application/json'},agent:false,timeout:this.timeout},res=>{
+      const request=(target.protocol==='https:'?https:http).get(target,{headers:{Authorization:`Bearer ${credentials.token}`,Accept:'application/json'},agent:false,timeout:this.timeout,signal},res=>{
         let body=''
         res.on('data',chunk=>{body+=chunk;if(Buffer.byteLength(body)>262144)request.destroy(new AccountError('服务器响应过大'))})
         res.on('error',()=>reject(new AccountError('服务器连接中断')))
         res.on('end',()=>{
           if(res.statusCode===401) return reject(new AccountError('登录已失效，请重新登录',401))
-          if(res.statusCode===403) return reject(new AccountError('当前账号没有这条线路的使用权限',403))
+          if(res.statusCode===403) {
+            let data={};try{data=JSON.parse(body)}catch{}
+            const error=new AccountError(data.error||'当前账号没有这条线路的使用权限',403);error.code=data.code||'ACCESS_DENIED';return reject(error)
+          }
           if(res.statusCode===404) return reject(new AccountError('线路不存在或服务器版本过旧，请刷新线路',404))
           if(res.statusCode!==200) return reject(new AccountError(`服务器请求失败（${res.statusCode}）`,res.statusCode))
           try{resolve(JSON.parse(body))}catch{reject(new AccountError('服务器返回了无效数据'))}
@@ -44,17 +50,17 @@ class AccountSession {
     this.current={...current,user}
     return user
   }
-  async resolve(payload) {
+  async resolve(payload,{signal}={}) {
     const current=this.current,epoch=this.epoch
     if(!current) throw new AccountError('请先登录',401)
     if(!payload || typeof payload!=='object') throw new AccountError('请选择线路')
     let result
     if(typeof payload.nodeId==='string' && payload.nodeId.length>0 && payload.nodeId.length<=200) {
-      const data=await this.request(current,`/api/nodes/${encodeURIComponent(payload.nodeId)}/config`)
+      const data=await this.request(current,`/api/nodes/${encodeURIComponent(payload.nodeId)}/config`,signal)
       if(typeof data.uri!=='string'||data.uri.length>32768||!data.node||data.node.id!==payload.nodeId) throw new AccountError('服务器返回的线路配置无效')
       result={uri:data.uri,id:data.node.id,name:String(data.node.name||'线路').slice(0,100),private:Boolean(data.node.private),nodeId:data.node.id}
     } else {
-      const {user}=await this.request(current,'/api/me')
+      const {user}=await this.request(current,'/api/me',signal)
       if(user?.role!=='shared') throw new AccountError('请先将个人线路保存到云端后再连接',403)
       if(typeof payload.uri!=='string'||!payload.uri||payload.uri.length>32768) throw new AccountError('本机线路无效')
       result={uri:payload.uri,id:String(payload.id||'local').slice(0,200),name:String(payload.name||'本机线路').slice(0,100),private:false,nodeId:null}

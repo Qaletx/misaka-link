@@ -30,17 +30,24 @@ async function run() {
   const browser = await chromium.launch({ channel: 'msedge', headless: true })
   const errors = []
   async function fixture(account) {
-    const context = await browser.newContext({ viewport: { width: 1020, height: 700 } })
+    const context = await browser.newContext({ viewport: { width: 960, height: 612 } })
     const db = { nodes: [{ ...privateNode }, ...(account.role === 'shared' ? [] : [{ ...personalNode }])], users: [user('root', 'admin', true), user('customer', 'user'), user('shared-team', 'shared')], requests: [], conflict: false, failImport: false, failList: false }
     await context.addInitScript(({ account }) => {
       window.__ipc = []
+      window.__policy = {autoRecover:true,automatic:false}
       window.__status = { phase: 'idle', connected: false, port: 10808 }
       window.__emitStatus = value => { window.__status = { ...window.__status, ...value }; window.__statusListener?.(window.__status) }
       if (!localStorage.getItem('misakaAccount')) localStorage.setItem('misakaAccount', JSON.stringify({ ...account, token: `fixture-${account.username}`, apiUrl: 'http://fixture.invalid' }))
       window.misaka = {
         setSession: async value => { window.__ipc.push({ op: 'setSession', value }); return { ok: true, user: account } },
         clearSession: async () => { window.__ipc.push({ op: 'clearSession' }); return { ok: true } },
-        getInfo: async () => ({ version: '0.5.0', core: true, coreName: 'sing-box', platform: 'win32' }),
+        getInfo: async () => ({ version: '0.6.0', core: true, coreName: 'sing-box', platform: 'win32' }),
+        getPreferences: async () => window.__policy,
+        setPreferences: async patch => {window.__policy={...window.__policy,...patch};return window.__policy},
+        setSelection: async value => {window.__policy.selection=value;return {ok:true}},
+        setCatalog: async () => ({ok:true}),
+        diagnose: async () => ({result:{ok:true,latencyMs:42},report:'qaletx link 0.6.0 脱敏报告\n连通性 42 ms'}),
+        diagnosticReport: async () => 'qaletx link 0.6.0 脱敏报告',
         getStatus: async () => window.__status,
         onStatus: callback => { window.__statusListener = callback; return () => { window.__statusListener = null } }, getLogs: async () => [],
         setProxyPort: async value => { window.__ipc.push({ op: 'setProxyPort', value }); window.__emitStatus({ port: value }); return { ok: true, port: value } },
@@ -55,7 +62,16 @@ async function run() {
       const body = req.postDataJSON()
       db.requests.push({ endpoint, method, body })
       let status = 200, data = { ok: true }
+      const usage=username=>({username,period:'2026-10',usedBytes:2500000000,quotaBytes:username==='root'?null:100000000000,metered:true,live:true,uploadBytes:500000000,downloadBytes:2000000000,sampledAt:Date.now(),...db.quotas?.[username]})
+      const deviceValues=[{id:'fixture-current',name:'我的电脑',platform:'win32',version:'0.6.0',lastSeenAt:Date.now(),current:true,proxyOnline:true},{id:'fixture-other',name:'备用电脑',platform:'darwin',version:'0.6.0',lastSeenAt:Date.now(),current:false,proxyOnline:false}].filter(s=>!db.removed?.includes(s.id))
       if (endpoint === '/api/me') data = { user: account }
+      else if(endpoint==='/api/me/usage')data={usage:usage(account.username)}
+      else if(endpoint==='/api/me/sessions'||/^\/api\/users\/[^/]+\/sessions$/.test(endpoint))data={sessions:account.role==='shared'?deviceValues.filter(s=>s.current):deviceValues}
+      else if(/^\/api\/sessions\//.test(endpoint)&&method==='DELETE'){db.removed=[...(db.removed||[]),endpoint.split('/').pop()];data={ok:true}}
+      else if(/^\/api\/users\/[^/]+\/usage$/.test(endpoint))data={usage:usage(endpoint.split('/')[3])}
+      else if(/^\/api\/users\/[^/]+\/quota$/.test(endpoint)){const username=endpoint.split('/')[3];db.quotas={...db.quotas,[username]:{quotaBytes:body.quotaBytes}};data={usage:usage(username)}}
+      else if(/^\/api\/users\/[^/]+\/quota\/reset$/.test(endpoint)){const username=endpoint.split('/')[3];db.quotas={...db.quotas,[username]:{...db.quotas?.[username],usedBytes:0}};data={usage:usage(username)}}
+      else if(endpoint==='/api/managed-services')data={services:[{id:'primary',ready:true,sampledAt:Date.now()}]}
       else if (endpoint === '/api/nodes' && method === 'GET') { status = db.failList ? 503 : 200; data = db.failList ? { error: 'fixture unavailable' } : { nodes: db.nodes } }
       else if (endpoint === '/api/nodes' && method === 'POST') {
         if (db.failImport) { status = 503; data = { error: 'fixture save failure' } }
@@ -70,14 +86,14 @@ async function run() {
       } else if (endpoint === '/api/users' && method === 'GET') data = { users: account.isRoot ? db.users : db.users.filter(value => value.role !== 'admin') }
       else if (endpoint === '/api/users' && method === 'POST') { const created = user(body.username, body.role); db.users.push(created); data = { user: created } }
       else if (/^\/api\/users\/[^/]+$/.test(endpoint) && method === 'PATCH') { const target = db.users.find(value => value.username === endpoint.split('/').pop()); Object.assign(target, body); data = { user: target } }
-      else if (endpoint === '/api/stats') data = { userCount: db.users.length, activeSessions: 1 }
+      else if (endpoint === '/api/stats') data = { userCount: db.users.length, activeSessions: 2,usage:db.users.map(u=>usage(u.username)),services:[{id:'primary',sampledAt:Date.now(),error:''}] }
       await route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(data), headers: { 'Access-Control-Allow-Origin': '*' } })
     })
     const page = await context.newPage(); page.setDefaultTimeout(10000)
     page.on('pageerror', error => errors.push(error.message))
     await page.goto(address)
     await page.getByRole('button', { name: '一键连接', exact: true }).waitFor()
-    await page.getByText('专属主线路', { exact: true }).waitFor()
+    await page.locator('.nodes-preview').getByText('专属主线路', { exact: true }).waitFor()
     return { page, context, db }
   }
   try {
@@ -89,7 +105,37 @@ async function run() {
     assert.ok(layout.connectBottom < layout.viewport)
     assert.ok(layout.height <= layout.viewport + 1)
     assert.equal((await page.evaluate(() => window.__ipc))[0].op, 'setSession')
-    await page.screenshot({ path: path.join(output, 'v05-dashboard.png') })
+    await page.screenshot({animations: 'disabled', path: path.join(output, 'v05-dashboard.png') })
+    await page.getByRole('button',{name:'管理概览',exact:true}).click()
+    await page.getByRole('dialog').getByText('把连接与用量，看清楚。',{exact:true}).waitFor()
+    await page.screenshot({animations: 'disabled',path:path.join(output,'v06-overview.png')})
+    await page.getByRole('dialog').getByRole('button',{name:'管理用户与额度'}).click()
+    await page.locator('.user-row').filter({hasText:'customer'}).getByRole('button',{name:'流量与设备'}).click()
+    await page.getByRole('dialog').getByText('备用电脑',{exact:true}).waitFor()
+    await page.getByRole('switch',{name:/不限流量/}).uncheck()
+    await page.getByLabel('每月额度（GB）').fill('300')
+    await page.getByRole('button',{name:'保存额度',exact:true}).click()
+    await page.waitForFunction(()=>document.querySelector('[role="dialog"] .usage-strip')?.textContent.includes('300.00 GB'))
+    assert.equal(db.quotas.customer.quotaBytes,300000000000)
+    await page.locator('.device-row').filter({hasText:'备用电脑'}).getByRole('button',{name:'退出会话'}).click()
+    await page.getByRole('button',{name:'确认退出',exact:true}).click()
+    await page.waitForFunction(()=>!document.querySelector('[role="dialog"] .device-list')?.textContent.includes('备用电脑'))
+    await page.screenshot({animations: 'disabled',path:path.join(output,'v06-quota-devices.png')})
+    await page.getByRole('button',{name:'关闭对话框',exact:true}).click()
+    await page.getByRole('button',{name:'关闭对话框',exact:true}).click()
+    await page.getByRole('button',{name:'偏好设置',exact:true}).first().click()
+    await page.getByRole('switch',{name:/自动选线与故障切线/}).check()
+    assert.equal(await page.evaluate(()=>window.__policy.automatic),true)
+    await page.screenshot({animations: 'disabled',path:path.join(output,'v06-preferences.png')})
+    await page.getByRole('dialog').getByRole('button',{name:'连接诊断',exact:true}).click()
+    await page.getByRole('button',{name:'一键诊断',exact:true}).click()
+    await page.getByRole('dialog').getByText('线路连通 · 42 ms',{exact:true}).waitFor()
+    await page.screenshot({animations: 'disabled',path:path.join(output,'v06-diagnostics.png')})
+    await page.getByRole('button',{name:'关闭对话框',exact:true}).click()
+    await page.setViewportSize({width:860,height:552})
+    assert.ok(await page.evaluate(()=>document.querySelector('.connect-button').getBoundingClientRect().bottom<innerHeight))
+    await page.screenshot({animations: 'disabled',path:path.join(output,'v06-small-dashboard.png')})
+    await page.setViewportSize({width:960,height:612})
     await page.evaluate(() => { window.__holdConnect = true })
     await page.getByRole('button', { name: '一键连接', exact: true }).click()
     const cancel = page.getByRole('button', { name: '取消连接', exact: true })
@@ -106,7 +152,7 @@ async function run() {
     await privateRow.getByText('42 ms', { exact: true }).waitFor()
     const testCall = (await page.evaluate(() => window.__ipc)).find(item => item.op === 'testNode')
     assert.equal(testCall.value.nodeId, 'private-one'); assert.equal('uri' in testCall.value, false)
-    await page.screenshot({ path: path.join(output, 'v05-nodes.png') })
+    await page.screenshot({animations: 'disabled', path: path.join(output, 'v05-nodes.png') })
     await dialog.getByRole('button', { name: '新增私有', exact: true }).click()
     await page.getByLabel('线路分享链接').fill('socks5://127.0.0.1:16663#One\nsocks5://127.0.0.1:16664#Two')
     await page.getByLabel('默认名称').fill('Only one allowed')
@@ -194,12 +240,12 @@ async function run() {
     await common.page.getByRole('button', { name: '导入线路', exact: true }).click()
     await common.page.getByLabel('分享链接').fill('socks5://127.0.0.1:16661#LocalOnly')
     await common.page.getByRole('button', { name: '验证并导入' }).click()
-    await common.page.getByRole('dialog').getByText('LocalOnly', { exact: true }).waitFor()
+    await common.page.locator('.modal-node-list').getByText('LocalOnly', { exact: true }).waitFor()
     assert.equal(common.db.requests.filter(item => item.endpoint === '/api/nodes' && item.method === 'POST').length, 0)
     const keys = await common.page.evaluate(() => Object.keys(localStorage))
     assert.ok(keys.some(key => key.includes('shared-one') && key.endsWith(':nodes')))
     await common.page.reload(); await common.page.getByRole('button', { name: /我的线路/ }).click()
-    await common.page.getByRole('dialog').getByText('LocalOnly', { exact: true }).waitFor()
+    await common.page.locator('.modal-node-list').getByText('LocalOnly', { exact: true }).waitFor()
     await common.context.close()
 
     const ordinary = await fixture(user('alice', 'user'))
@@ -214,9 +260,9 @@ async function run() {
     assert.match(await ordinary.page.getByLabel('分享链接').inputValue(), /CloudOnly/)
     ordinary.db.failImport = false
     await ordinary.page.getByRole('button', { name: '验证并导入' }).click()
-    await ordinary.page.getByRole('dialog').getByText('CloudOnly', { exact: true }).waitFor()
+    await ordinary.page.locator('.modal-node-list').getByText('CloudOnly', { exact: true }).waitFor()
     await ordinary.page.reload(); await ordinary.page.getByRole('button', { name: /我的线路/ }).click()
-    await ordinary.page.getByRole('dialog').getByText('CloudOnly', { exact: true }).waitFor()
+    await ordinary.page.locator('.modal-node-list').getByText('CloudOnly', { exact: true }).waitFor()
     assert.equal((await ordinary.page.evaluate(() => Object.keys(localStorage))).some(key => key.endsWith(':nodes')), false)
     const uploadsBeforeLegacy = ordinary.db.requests.filter(item => item.endpoint === '/api/nodes' && item.method === 'POST').length
     await ordinary.page.evaluate(() => localStorage.setItem('qaletxNodes', JSON.stringify([{ id: 'legacy', name: 'Legacy', uri: 'socks5://127.0.0.1:16667#Legacy' }])))

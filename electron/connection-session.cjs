@@ -58,11 +58,11 @@ class ConnectionSession {
       return result
     }catch(error){
       if(!current())return cancelled()
-      this.manager.update({phase:'error',stage:'',error:error.message})
-      return {ok:false,message:error.message}
+      this.manager.update({phase:'error',stage:'',error:error.message,errorCode:error.code||(error.status?'AUTH_'+error.status:'NETWORK')})
+      return {ok:false,message:error.message,code:error.code||(error.status?'AUTH_'+error.status:'NETWORK')}
     }finally{this.connectionsInFlight--}
   }
-  disconnect(){++this.connectionEpoch;this.stopWatch();return this.manager.disconnect()}
+  disconnect(){++this.connectionEpoch;this.account.cancelRequests?.();this.stopWatch();return this.manager.disconnect()}
   async testNode(payload) {
     const generation=this.generation,probe=this.probe
     try{
@@ -80,7 +80,7 @@ class ConnectionSession {
     const check={active,generation,epoch}
     this.checking=check
     const current=()=>this.checking===check&&active===this.active&&generation===this.generation&&epoch===this.connectionEpoch
-    let reason=''
+    let reason='',stopCode='AUTH_STOP'
     try{
       const node=await this.account.resolve(active.nodeId?{nodeId:active.nodeId}:active.local)
       if(!current())return
@@ -88,8 +88,8 @@ class ConnectionSession {
       this.failures=0
     }catch(error){
       if(!current())return
-      if([401,403,404].includes(error.status)) reason='登录或线路授权已失效，连接已断开'
-      else if(++this.failures>=2)reason='连续两次无法验证线路授权，已断开；请恢复账号服务器连接'
+      if([401,403,404].includes(error.status)){reason=error.code==='QUOTA_EXCEEDED'?error.message:'登录或线路授权已失效，连接已断开';stopCode=error.code==='QUOTA_EXCEEDED'?error.code:'AUTH_STOP'}
+      else if(++this.failures>=2){reason='连续两次无法验证线路授权，已断开；请恢复账号服务器连接';stopCode='ACCOUNT_OFFLINE'}
     }finally{if(this.checking===check)this.checking=null}
     if(reason&&active===this.active&&generation===this.generation&&epoch===this.connectionEpoch){
       const disconnecting=this.disconnect(),disconnectEpoch=this.connectionEpoch
@@ -98,7 +98,7 @@ class ConnectionSession {
       // outage counter belong to that connection, never to this old check.
       if(generation!==this.generation||disconnectEpoch!==this.connectionEpoch)return
       const message=stopped.ok?reason:`${reason}；${stopped.message}`
-      this.manager.update({phase:'error',error:message})
+      this.manager.update({phase:'error',error:message,errorCode:stopped.ok?stopCode:'PROXY_RESTORE_FAILED'})
       this.manager.log('warn',message)
     }
   }

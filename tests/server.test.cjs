@@ -106,7 +106,7 @@ test('two-file deployment, complete safeUser, permissions, root protection and C
   const root = await app.login()
   const user = await app.login('user', USER_PASSWORD)
   const me = await app.request('GET', '/api/me', undefined, user)
-  assert.deepEqual(Object.keys(me.body.user).sort(), ['createdAt', 'disabled', 'expiresAt', 'isRoot', 'permissions', 'privateNodeAccess', 'privateNodeIds', 'role', 'updatedAt', 'username'])
+  assert.deepEqual(Object.keys(me.body.user).sort(), ['createdAt', 'disabled', 'expiresAt', 'isRoot', 'permissions', 'privateNodeAccess', 'privateNodeIds', 'quotaBytes', 'role', 'updatedAt', 'username'])
   assert.equal(me.body.user.disabled, false)
   assert.equal(me.body.user.expiresAt, null)
   for (const [method, endpoint, body] of [
@@ -488,7 +488,7 @@ test('legacy users migrate once preserving password hashes and original file, an
   assert.equal((await app.request('GET', '/api/nodes/misaka/config', undefined, user)).status, 200)
   assert.equal(fs.readFileSync(path.join(app.directory, 'data', 'users.json'), 'utf8'), original)
   const saved = JSON.parse(fs.readFileSync(path.join(app.directory, 'data', 'state.json'), 'utf8'))
-  assert.equal(saved.schemaVersion, 2)
+  assert.equal(saved.schemaVersion, 3)
   assert.equal(saved.users.find(item => item.username === 'root').role, 'admin')
   assert.equal(saved.users[0].hash, JSON.parse(original)[0].hash)
   assert.equal((await app.request('DELETE', '/api/private-nodes/misaka', undefined, root)).status, 200)
@@ -584,4 +584,77 @@ test('shared account retains more than 10 concurrent sessions without kicking ou
   assert.equal((await app.request('GET', '/api/me', undefined, tokens[0])).status, 200)
   assert.equal((await app.request('GET', '/api/me', undefined, tokens[10])).status, 200)
   assert.equal((await app.request('GET', '/api/stats', undefined, root)).body.activeSessions, 12)
+})
+
+async function managedFixture(t) {
+  const values={counters:{'legacy-static':{tx:1,rx:2}},online:{'legacy-static':1},kicks:[]}
+  const stats=http.createServer(async(req,res)=>{
+    if(req.headers.authorization!=='isolated-stats-secret-123456')return res.writeHead(403).end()
+    if(req.url==='/traffic')return res.writeHead(200,{'Content-Type':'application/json'}).end(JSON.stringify(values.counters))
+    if(req.url==='/online')return res.writeHead(200,{'Content-Type':'application/json'}).end(JSON.stringify(values.online))
+    let raw='';for await(const chunk of req)raw+=chunk
+    const ids=JSON.parse(raw);values.kicks.push(...ids);for(const id of ids)delete values.online[id]
+    res.writeHead(200).end()
+  })
+  await new Promise(resolve=>stats.listen(0,'127.0.0.1',resolve))
+  t.after(()=>{stats.closeAllConnections();return new Promise(resolve=>stats.close(resolve))})
+  const authPort=await freePort(),configuration=[{id:'primary',statsUrl:`http://127.0.0.1:${stats.address().port}`,secret:'isolated-stats-secret-123456'}]
+  const app=await fixture(t,{privateUri:'hysteria2://old@127.0.0.1:10443?auth=old&sni=test.invalid&insecure=1',prepare:directory=>{
+    fs.appendFileSync(path.join(directory,'.env'),`MISAKA_HY2_SERVICES=${JSON.stringify(configuration)}\nMISAKA_HY2_AUTH_PORT=${authPort}\nMISAKA_HY2_POLL_MS=250\n`)
+  }})
+  const internal=async(route,body={})=>{
+    const response=await fetch(`http://127.0.0.1:${authPort}${route}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(5000)})
+    return response.json()
+  }
+  const root=await app.login(),user=await app.login('user',USER_PASSWORD)
+  await delay(350);assert.equal(values.kicks.includes('legacy-static'),false,'preparing stats must not kick legacy clients before the service is bound')
+  await app.request('PATCH','/api/users/user',{privateNodeAccess:true,privateNodeIds:['misaka']},root)
+  await app.request('PATCH','/api/private-nodes/misaka',{revision:1,managedServiceId:'primary'},root)
+  assert.equal((await internal('/boot/primary')).ok,true)
+  const until=async check=>{for(let i=0;i<80;i++){const value=await check();if(value)return value;await delay(50)}assert.fail('managed fixture timeout')}
+  await until(async()=>(await app.request('GET','/api/me/usage',undefined,user)).body.usage.live)
+  return {app,values,root,user,internal,until}
+}
+test('managed Hysteria credentials, server traffic deltas, quota pause, reset and restart preserve accounting',async t=>{
+  const {app,values,root,user,internal,until}=await managedFixture(t)
+  const config=await app.request('GET','/api/nodes/misaka/config',undefined,user)
+  const uri=new URL(config.body.uri);assert.match(uri.username,/^ql1\./);assert.equal(uri.searchParams.has('auth'),false)
+  assert.equal((await app.request('GET','/api/nodes',undefined,user)).body.nodes[0].uri,undefined)
+  assert.equal((await internal('/auth/primary',{auth:'old'})).ok,false)
+  const auth=await internal('/auth/primary',{auth:uri.username});assert.equal(auth.ok,true)
+  assert.equal((await internal('/auth/primary',{auth:uri.username.slice(0,-1)+'!'})).ok,false)
+  await app.request('PATCH','/api/users/user/quota',{quotaBytes:1000},root)
+  values.counters[auth.id]={tx:300,rx:900};values.online[auth.id]=1
+  await until(()=>values.kicks.includes(auth.id))
+  const usage=(await app.request('GET','/api/me/usage',undefined,user)).body.usage
+  assert.equal(usage.usedBytes,1200);assert.equal(usage.exceeded,true)
+  assert.equal(usage.uploadBytes,300);assert.equal(usage.downloadBytes,900)
+  const denied=await app.request('GET','/api/nodes/misaka/config',undefined,user);assert.equal(denied.status,403);assert.equal(denied.body.code,'QUOTA_EXCEEDED')
+  assert.equal((await internal('/auth/primary',{auth:uri.username})).ok,false)
+  await delay(400);assert.equal((await app.request('GET','/api/me/usage',undefined,user)).body.usage.usedBytes,1200)
+  const reset=await app.request('POST','/api/users/user/quota/reset',{},root);assert.equal(reset.body.usage.usedBytes,0)
+  assert.equal((await internal('/auth/primary',{auth:uri.username})).ok,true)
+  values.counters[auth.id]={tx:400,rx:1100}
+  await until(async()=>(await app.request('GET','/api/me/usage',undefined,user)).body.usage.usedBytes===300)
+  await app.stop();await app.start();const again=await app.login('user',USER_PASSWORD)
+  await delay(350);assert.equal((await app.request('GET','/api/me/usage',undefined,again)).body.usage.usedBytes,300)
+  const changed=(await app.request('GET','/api/nodes/misaka/config',undefined,again)).body.uri;assert.notEqual(changed,config.body.uri)
+  const first=(await internal('/auth/primary',{auth:new URL(changed).username})).id
+  await internal('/boot/primary');const second=(await internal('/auth/primary',{auth:new URL(changed).username}))
+  // Quota-limited users wait for a fresh sample after a daemon boot.
+  if(!second.ok)await until(async()=>(await app.request('GET','/api/me/usage',undefined,again)).body.usage.live)
+  const next=second.ok?second:await internal('/auth/primary',{auth:new URL(changed).username});assert.equal(next.ok,true);assert.notEqual(first,next.id)
+})
+test('device metadata is safe, ordinary users cannot revoke another user, and shared users see only their own session',async t=>{
+  const app=await fixture(t),root=await app.login(),user=await app.login('user',USER_PASSWORD)
+  const login=await app.request('POST','/api/login',{username:'user',password:USER_PASSWORD,device:{id:crypto.randomUUID(),name:'客户电脑',platform:'win32',version:'0.6.0'}})
+  const own=(await app.request('GET','/api/me/sessions',undefined,login.body.token)).body.sessions
+  assert.equal(own.length,2);assert.equal(own.find(s=>s.current).name,'客户电脑');assert.equal(JSON.stringify(own).includes(login.body.token),false)
+  const rootSessions=(await app.request('GET','/api/me/sessions',undefined,root)).body.sessions
+  assert.equal((await app.request('DELETE',`/api/sessions/${rootSessions[0].id}`,undefined,user)).status,403)
+  const removed=await app.request('DELETE',`/api/sessions/${own.find(s=>s.current).id}`,undefined,root);assert.equal(removed.status,200)
+  assert.equal((await app.request('GET','/api/me',undefined,login.body.token)).status,401)
+  await createUser(app,root,'shareddevices','shared');const first=await app.login('shareddevices',NEW_PASSWORD),second=await app.login('shareddevices',NEW_PASSWORD)
+  const one=(await app.request('GET','/api/me/sessions',undefined,first)).body.sessions,other=(await app.request('GET','/api/me/sessions',undefined,second)).body.sessions
+  assert.equal(one.length,1);assert.equal((await app.request('DELETE',`/api/sessions/${other[0].id}`,undefined,first)).status,403)
 })

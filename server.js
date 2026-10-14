@@ -1,8 +1,9 @@
 'use strict'
 
 // Standalone: upload server.js + .env and run node server.js (no npm install).
-// Account access is enforced here; Hysteria2 credentials are managed separately.
+// Optional managed Hysteria2 authentication and accounting also use Node built-ins.
 const http = require('http')
+const https = require('https')
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
@@ -67,7 +68,7 @@ for (const origin of CORS_ORIGINS) {
 }
 
 class HttpError extends Error {
-  constructor(status, message) { super(message); this.status = status }
+  constructor(status, message, code) { super(message); this.status = status; this.code = code }
 }
 function passwordValid(password) {
   return typeof password === 'string' && password.length >= 8 && password.length <= 256
@@ -148,6 +149,9 @@ function validateUsers(value, legacy = false) {
       || typeof user.salt !== 'string' || !/^[a-f0-9]{32}$/.test(user.salt)
       || (user.disabled !== undefined && typeof user.disabled !== 'boolean')) throw new Error('用户数据库记录无效，请从备份恢复')
     names.add(user.username)
+    if (!user.uid) user.uid = crypto.randomUUID()
+    if (user.quotaBytes === undefined) user.quotaBytes = null
+    if (typeof user.uid !== 'string' || !/^[a-f0-9-]{36}$/.test(user.uid) || (user.quotaBytes !== null && (!Number.isSafeInteger(user.quotaBytes) || user.quotaBytes < 0))) throw new Error('用户额度记录无效，请从备份恢复')
     user.disabled = user.disabled === true
     user.expiresAt = user.expiresAt == null ? null : parseExpiry(user.expiresAt)
     if (legacy) { user.privateNodeAccess = true; user.privateNodeIds = ['misaka'] }
@@ -161,7 +165,7 @@ function validateUsers(value, legacy = false) {
 function seedState() {
   if (fs.existsSync(STATE_FILE)) {
     const value = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))
-    if (!value || value.schemaVersion !== 2 || !Array.isArray(value.nodes) || !Array.isArray(value.annotations)) throw new Error('data/state.json 格式无效，请从备份恢复')
+    if (!value || ![2,3].includes(value.schemaVersion) || !Array.isArray(value.nodes) || !Array.isArray(value.annotations)) throw new Error('data/state.json 格式无效，请从备份恢复')
     validateUsers(value.users)
     const ids = new Set()
     for (const node of value.nodes) {
@@ -176,6 +180,11 @@ function seedState() {
         || !value.nodes.some(node => node.id === item.nodeId && node.private)) throw new Error('数据库备注记录无效，请从备份恢复')
       nodeText(item.name, '线路名称', 100); nodeText(item.note, '线路备注', 500)
     }
+    if (value.schemaVersion === 2) {
+      fs.copyFileSync(STATE_FILE, path.join(DATA_DIR, 'state-v2-backup-' + Date.now() + '.json'))
+      value.schemaVersion = 3; value.traffic = emptyTraffic(); saveState(value)
+    }
+    if (!value.traffic || !['epochs','identities','cursors','periods','baselines'].every(key => value.traffic[key] && typeof value.traffic[key] === 'object' && !Array.isArray(value.traffic[key]))) throw new Error('流量数据库格式无效，请从备份恢复')
     return value
   }
   let seededUsers
@@ -189,7 +198,8 @@ function seedState() {
       { username: 'user', role: 'user', ...hashPassword(USER_PASSWORD), privateNodeAccess: false, privateNodeIds: [], disabled: false, expiresAt: null, createdAt: now, updatedAt: now }
     ]
   }
-  const value = { schemaVersion: 2, users: seededUsers, nodes: PRIVATE_NODE_URI ? [newNode(PRIVATE_NODE_URI, null, { name: '默认专属线路' }, 'misaka')] : [], annotations: [] }
+  validateUsers(seededUsers)
+  const value = { schemaVersion: 3, users: seededUsers, nodes: PRIVATE_NODE_URI ? [newNode(PRIVATE_NODE_URI, null, { name: '默认专属线路' }, 'misaka')] : [], annotations: [], traffic: emptyTraffic() }
   saveState(value)
   return value
 }
@@ -207,7 +217,7 @@ function isActive(user, now = Date.now()) {
 function pruneSessions() {
   const now = Date.now()
   for (const [token, session] of sessions) {
-    if (session.expiresAt <= now || !isActive(users.find(user => user.username === session.username), now)) sessions.delete(token)
+    if (session.expiresAt <= now || !isActive(users.find(user => user.username === session.username), now)) revokeSession(token,session)
   }
   for (const [key, attempt] of loginAttempts) if (attempt.resetAt <= now) loginAttempts.delete(key)
 }
@@ -242,19 +252,22 @@ function requireAttempt(req, purpose = 'login') {
   if (entry.count > 20) throw new HttpError(429, '尝试次数过多，请 10 分钟后再试')
 }
 function revokeUserSessions(username) {
-  for (const [token, session] of sessions) if (session.username === username) sessions.delete(token)
+  for (const [token, session] of sessions) if (session.username === username) revokeSession(token, session)
 }
 function safeUser(user) {
-  return { username: user.username, role: user.role, isRoot: user.username === 'root', privateNodeAccess: user.privateNodeAccess, privateNodeIds: [...user.privateNodeIds], disabled: user.disabled === true, expiresAt: user.expiresAt || null, createdAt: user.createdAt, updatedAt: user.updatedAt, permissions: { manageUsers: user.role === 'admin', managePrivateNodes: user.username === 'root', changePassword: user.role !== 'shared', syncNodes: user.role !== 'shared' } }
+  return { username: user.username, role: user.role, isRoot: user.username === 'root', privateNodeAccess: user.privateNodeAccess, privateNodeIds: [...user.privateNodeIds], disabled: user.disabled === true, expiresAt: user.expiresAt || null, quotaBytes: user.quotaBytes, createdAt: user.createdAt, updatedAt: user.updatedAt, permissions: { manageUsers: user.role === 'admin', managePrivateNodes: user.username === 'root', changePassword: user.role !== 'shared', syncNodes: user.role !== 'shared' } }
 }
-function issueToken(username) {
+function issueToken(username, device = {}) {
   pruneSessions()
   const owned = [...sessions].filter(([, session]) => session.username === username)
   const limit = users.find(user => user.username === username)?.role === 'shared' ? MAX_SHARED_SESSIONS : MAX_USER_SESSIONS
-  while (owned.length >= limit) sessions.delete(owned.shift()[0])
+  while (owned.length >= limit) {const [key, value] = owned.shift(); revokeSession(key, value)}
   if (sessions.size >= MAX_SESSIONS) throw new HttpError(503, '登录会话已达上限，请稍后再试')
   const token = crypto.createHmac('sha256', TOKEN_SECRET).update(crypto.randomBytes(32)).digest('base64url')
-  sessions.set(token, { username, expiresAt: Date.now() + SESSION_MS })
+  const now = Date.now()
+  sessions.set(token, { id: crypto.randomUUID(), username, expiresAt: now + SESSION_MS, createdAt: now, lastSeenAt: now,
+    deviceId: typeof device.id === 'string' && /^[a-zA-Z0-9_-]{8,80}$/.test(device.id) ? device.id : null,
+    name: nodeText(device.name, '设备名称', 80, '未命名设备') || '未命名设备', platform: nodeText(device.platform, '系统名称', 32, 'unknown'), version: nodeText(device.version, '客户端版本', 32, '旧版客户端') })
   return token
 }
 function bearer(req) {
@@ -266,7 +279,8 @@ function authenticate(req) {
   const session = sessions.get(token)
   if (!session) return null
   const user = users.find(item => item.username === session.username)
-  if (session.expiresAt <= Date.now() || !isActive(user)) { sessions.delete(token); return null }
+  if (session.expiresAt <= Date.now() || !isActive(user)) { revokeSession(token,session); return null }
+  session.lastSeenAt = Date.now()
   return user
 }
 function send(res, status, body) {
@@ -376,7 +390,7 @@ function findNode(actor, id) {
 function safeNode(actor, node) {
   const annotation = state.annotations.find(item => item.username === actor.username && item.nodeId === node.id)
   return { id: node.id, name: annotation?.name || node.name, note: annotation && annotation.note !== undefined ? annotation.note : node.note,
-    protocol: node.protocol, private: node.private, ...(!node.private ? { uri: node.uri } : {}), updatedAt: annotation?.updatedAt || node.updatedAt, revision: node.revision }
+    protocol: node.protocol, private: node.private, managedServiceId: node.managedServiceId || null, metered: Boolean(node.managedServiceId), ...(!node.private ? { uri: node.uri } : {}), updatedAt: annotation?.updatedAt || node.updatedAt, revision: node.revision }
 }
 function checkRevision(body, node) {
   if (!Number.isSafeInteger(body.revision) || body.revision < 1) throw new HttpError(400, '修改线路必须提供 revision')
@@ -389,6 +403,169 @@ function updateNode(node, body) {
   return { ...node, name: nodeText(body.name, '线路名称', 100, node.name) || '未命名线路', note: nodeText(body.note, '线路备注', 500, node.note), revision: node.revision + 1, updatedAt: new Date().toISOString() }
 }
 
+function emptyTraffic() { return { epochs: {}, accessEpochs: {}, identities: {}, cursors: {}, periods: {}, baselines: {}, gaps: [] } }
+const managedServices = new Map()
+const pendingKicks = new Map()
+let collecting = false
+let managedConfiguration
+try { managedConfiguration = JSON.parse(process.env.MISAKA_HY2_SERVICES || '[]') } catch { throw new Error('MISAKA_HY2_SERVICES 必须为 JSON 数组') }
+if (!Array.isArray(managedConfiguration) || managedConfiguration.length > 20) throw new Error('最多接管 20 个 Hysteria2 服务')
+for (const item of managedConfiguration) {
+  let url
+  try { url = new URL(item.statsUrl) } catch { throw new Error('Hysteria2 统计地址无效') }
+  if (!/^[a-z][a-z0-9_-]{0,31}$/.test(item.id) || managedServices.has(item.id) || !['http:','https:'].includes(url.protocol)
+    || !['127.0.0.1','[::1]'].includes(url.hostname) || url.username || url.password || url.search || url.hash || url.pathname !== '/'
+    || typeof item.secret !== 'string' || item.secret.length < 16 || /[\r\n]/.test(item.secret)) throw new Error('Hysteria2 接管配置无效：统计接口须绑定回环地址，并设置至少 16 位密钥')
+  managedServices.set(item.id, { id: item.id, url: url.origin, secret: item.secret, lastSampleAt: null, error: '', online: {} })
+}
+const AUTH_PORT = Number(process.env.MISAKA_HY2_AUTH_PORT || 8788)
+const POLL_MS = Number(process.env.MISAKA_HY2_POLL_MS || 5000)
+if (!Number.isInteger(AUTH_PORT) || AUTH_PORT < 1 || AUTH_PORT > 65535 || (managedServices.size && AUTH_PORT === PORT)) throw new Error('Hysteria2 内部鉴权端口无效或与账号端口重复')
+if (!Number.isInteger(POLL_MS) || POLL_MS < 250 || POLL_MS > 10000) throw new Error('流量采样间隔必须为 250–10000 毫秒')
+function quotaPeriod(now = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit' }).formatToParts(now)
+  return parts.find(x => x.type === 'year').value + '-' + parts.find(x => x.type === 'month').value
+}
+function serviceEpoch(id) { return Object.prototype.hasOwnProperty.call(state.traffic.epochs,id) ? state.traffic.epochs[id] : null }
+function knownIdentity(id) { return Object.prototype.hasOwnProperty.call(state.traffic.identities,id) ? state.traffic.identities[id] : null }
+function userUsage(user) {
+  const period = quotaPeriod(), key = period + ':' + user.uid
+  const total = state.traffic.periods[key] || { up: 0, down: 0 }
+  const baseline = state.traffic.baselines[key] || 0
+  const usedBytes = Math.max(0, total.up + total.down - baseline)
+  const relevant = [...new Set(state.nodes.filter(node => node.private && node.managedServiceId && allowedNode(user,node)).map(node => node.managedServiceId))].map(id=>managedServices.get(id)).filter(Boolean)
+  return { period, timezone: 'Asia/Shanghai', uploadBytes: total.up, downloadBytes: total.down, usedBytes,
+    quotaBytes: user.username === 'root' ? null : user.quotaBytes, exceeded: user.username !== 'root' && user.quotaBytes !== null && usedBytes >= user.quotaBytes,
+    warning: user.quotaBytes > 0 ? usedBytes / user.quotaBytes >= .95 ? 'critical' : usedBytes / user.quotaBytes >= .8 ? 'near' : null : null,
+    metered: relevant.length > 0, live: relevant.length > 0 && relevant.every(s=>s.lastSampleAt && Date.now()-s.lastSampleAt<30000),
+    sampledAt: relevant.length ? Math.min(...relevant.map(s=>s.lastSampleAt || 0)) || null : null }
+}
+function requestManaged(service, route, body) {
+  return new Promise((resolve,reject) => {
+    const content = body === undefined ? undefined : JSON.stringify(body)
+    const target = new URL(route, service.url)
+    const req = (target.protocol === 'https:' ? https : http).request(target, { method: content ? 'POST' : 'GET', timeout: 1800,
+      headers: { Authorization: service.secret, ...(content ? {'Content-Type':'application/json','Content-Length':Buffer.byteLength(content)} : {}) } }, res => {
+      let data = ''
+      res.on('data', chunk => {data+=chunk;if(Buffer.byteLength(data)>4*1024*1024)req.destroy(new Error('响应过大'))})
+      res.on('error',reject)
+      res.on('end',()=>{if(res.statusCode!==200)return reject(new Error('统计接口请求失败'));try{resolve(data?JSON.parse(data):{})}catch{reject(new Error('统计接口数据无效'))}})
+    })
+    req.on('timeout',()=>req.destroy(new Error('统计接口超时')));req.on('error',reject);req.end(content)
+  })
+}
+function enqueueKick(serviceId,id) {const ids=pendingKicks.get(serviceId)||new Set();ids.add(id);pendingKicks.set(serviceId,ids)}
+function revokeSession(token,session) {
+  sessions.delete(token)
+  for(const [id,identity] of Object.entries(state.traffic.identities))if(identity.sid===session.id)enqueueKick(identity.serviceId,id)
+  flushKicks().catch(()=>{})
+}
+let flushing=false
+async function flushKicks() {
+  if(flushing)return;flushing=true
+  try { await Promise.all([...pendingKicks].map(async([serviceId,ids])=>{
+    const service=managedServices.get(serviceId);if(!service||!ids.size)return
+    const batch=[...ids]
+    try{await requestManaged(service,'/kick',batch);for(const id of batch)ids.delete(id)}catch{service.error='连接撤销尚未完成，正在重试'}
+  })) } finally {flushing=false}
+}
+function credential(session,node) {
+  const encoded=Buffer.from(node.id).toString('base64url')
+  const prefix=`ql1.${session.id}.${encoded}`
+  return prefix+'.'+crypto.createHmac('sha256',TOKEN_SECRET).update('hy2:'+prefix).digest('base64url')
+}
+function managedUri(req,user,node) {
+  if(!node.managedServiceId)return node.uri
+  const service=managedServices.get(node.managedServiceId),usage=userUsage(user)
+  if(!service||!serviceEpoch(service.id))throw new HttpError(503,'这条线路尚未完成服务端接管，请联系管理员','METER_UNREADY')
+  if(usage.exceeded)throw new HttpError(403,'本月私有线路流量额度已用完，请联系管理员','QUOTA_EXCEEDED')
+  if(user.quotaBytes!==null && (!service.lastSampleAt||Date.now()-service.lastSampleAt>=30000))throw new HttpError(503,'线路计量服务暂时不可用，请稍后重试','METER_OFFLINE')
+  const session=sessions.get(bearer(req)),url=new URL(node.uri)
+  url.username=credential(session,node);url.password='';url.searchParams.delete('auth');return url.href
+}
+function identityAllowed(identity) {
+  const session=[...sessions.values()].find(s=>s.id===identity.sid),user=users.find(u=>u.uid===identity.uid),node=state.nodes.find(n=>n.id===identity.nodeId)
+  return session&&session.expiresAt>Date.now()&&isActive(user)&&node&&node.managedServiceId===identity.serviceId&&allowedNode(user,node)&&!userUsage(user).exceeded
+    &&identity.period===quotaPeriod()&&identity.accessEpoch===(state.traffic.accessEpochs?.[user.uid]||'initial')
+    &&identity.bindingEpoch===(node.bindingEpoch||'initial')
+}
+async function collectTraffic() {
+  if(collecting)return;collecting=true
+  try{await Promise.all([...managedServices.values()].map(async service=>{
+    try{
+      const [counters,online]=await Promise.all([requestManaged(service,'/traffic'),requestManaged(service,'/online')])
+      if(!counters||typeof counters!=='object'||Array.isArray(counters)||!online||typeof online!=='object'||Array.isArray(online))throw new Error('数据无效')
+      for(const value of Object.values(counters))if(!value||!Number.isSafeInteger(value.tx)||value.tx<0||!Number.isSafeInteger(value.rx)||value.rx<0)throw new Error('计数器无效')
+      for(const value of Object.values(online))if(!Number.isSafeInteger(value)||value<0)throw new Error('在线数据无效')
+      const next=JSON.parse(JSON.stringify(state)),traffic=next.traffic,period=quotaPeriod()
+      const enforceUnknown=Boolean(serviceEpoch(service.id))&&state.nodes.some(node=>node.private&&node.managedServiceId===service.id)
+      for(const [id,value] of Object.entries(counters)){
+        const identity=knownIdentity(id);if(!identity||identity.serviceId!==service.id){if(enforceUnknown&&online[id])enqueueKick(service.id,id);continue}
+        const previous=traffic.cursors[id]||{tx:0,rx:0}
+        const reset=value.tx<previous.tx||value.rx<previous.rx
+        const up=reset?value.tx:value.tx-previous.tx,down=reset?value.rx:value.rx-previous.rx
+        if(reset)traffic.gaps=[...(traffic.gaps||[]),{serviceId:service.id,time:Date.now(),reason:'计数器重置，已记录采样缺口'}].slice(-50)
+        const key=period+':'+identity.uid,total=traffic.periods[key]||{up:0,down:0}
+        total.up+=up;total.down+=down
+        if(!Number.isSafeInteger(total.up)||!Number.isSafeInteger(total.down))throw new Error('累计值越界')
+        traffic.periods[key]=total;traffic.cursors[id]={tx:value.tx,rx:value.rx}
+      }
+      persistState(next);service.online=online;service.lastSampleAt=Date.now();service.error=''
+      for(const [id,count] of Object.entries(online))if(count&&(knownIdentity(id)?!identityAllowed(knownIdentity(id)):enforceUnknown))enqueueKick(service.id,id)
+    }catch{service.error='统计接口暂时不可用，请检查节点服务';service.online={}}
+  }));await flushKicks()}finally{collecting=false}
+}
+function safeSession(value,current) {
+  const identities=Object.entries(state.traffic.identities).filter(([,i])=>i.sid===value.id)
+  const online=identities.some(([id,i])=>{const service=managedServices.get(i.serviceId);return service?.lastSampleAt&&Date.now()-service.lastSampleAt<30000&&service.online[id]>0})
+  return {id:value.id,deviceId:value.deviceId,name:value.name,platform:value.platform,version:value.version,createdAt:new Date(value.createdAt).toISOString(),lastSeenAt:new Date(value.lastSeenAt).toISOString(),expiresAt:new Date(value.expiresAt).toISOString(),current:value.id===current?.id,proxyOnline:online}
+}
+async function managementRoute(req,res,url,actor) {
+  if(req.method==='GET'&&url.pathname==='/api/me/usage'){send(res,200,{usage:userUsage(actor)});return true}
+  if(req.method==='GET'&&url.pathname==='/api/me/sessions'){
+    const current=sessions.get(bearer(req));send(res,200,{sessions:[...sessions.values()].filter(s=>s.username===actor.username&&(actor.role!=='shared'||s.id===current.id)).map(s=>safeSession(s,current))});return true
+  }
+  const deviceMatch=url.pathname.match(/^\/api\/users\/([^/]+)\/sessions$/)
+  if(req.method==='GET'&&deviceMatch){
+    const target=users.find(u=>u.username===decodeName(deviceMatch[1]));if(!target)throw new HttpError(404,'用户不存在');manageable(actor,target)
+    send(res,200,{sessions:[...sessions.values()].filter(s=>s.username===target.username).map(s=>safeSession(s,sessions.get(bearer(req))))});return true
+  }
+  const sessionMatch=url.pathname.match(/^\/api\/sessions\/([^/]+)$/)
+  if(req.method==='DELETE'&&sessionMatch){
+    const found=[...sessions].find(([,s])=>s.id===sessionMatch[1]);if(!found)throw new HttpError(404,'会话已退出')
+    const target=users.find(u=>u.username===found[1].username),current=sessions.get(bearer(req))
+    if(actor.username!==target?.username)manageable(actor,target)
+    else if(actor.role==='shared'&&found[1].id!==current.id)throw new HttpError(403,'共用账号不能退出其他使用者')
+    revokeSession(...found);send(res,200,{ok:true,current:found[1].id===current.id});return true
+  }
+  const usageMatch=url.pathname.match(/^\/api\/users\/([^/]+)\/(usage|quota|quota\/reset)$/)
+  if(usageMatch){
+    const target=users.find(u=>u.username===decodeName(usageMatch[1]));if(!target)throw new HttpError(404,'用户不存在');manageable(actor,target)
+    if(req.method==='GET'&&usageMatch[2]==='usage'){send(res,200,{usage:userUsage(target)});return true}
+    if(target.username==='root')throw new HttpError(400,'root 账号保持不限额')
+    if(req.method==='PATCH'&&usageMatch[2]==='quota'){
+      const body=await readBody(req),currentActor=requireCurrentActor(req);onlyFields(body,['quotaBytes'],true)
+      if(body.quotaBytes!==null&&(!Number.isSafeInteger(body.quotaBytes)||body.quotaBytes<0))throw new HttpError(400,'quotaBytes 必须为非负整数字节数，或 null 表示不限额')
+      const latest=users.find(u=>u.uid===target.uid);if(!latest)throw new HttpError(404,'用户不存在')
+      manageable(currentActor,latest)
+      const wasExceeded=userUsage(latest).exceeded
+      const updated={...latest,quotaBytes:body.quotaBytes,updatedAt:new Date().toISOString()}
+      const nextTraffic=wasExceeded&&!userUsage(updated).exceeded?{...state.traffic,accessEpochs:{...state.traffic.accessEpochs,[latest.uid]:crypto.randomBytes(8).toString('hex')}}:state.traffic
+      persistState({...state,users:users.map(u=>u.uid===latest.uid?updated:u),traffic:nextTraffic})
+      await collectTraffic();send(res,200,{ok:true,usage:userUsage(users.find(u=>u.uid===target.uid))});return true
+    }
+    if(req.method==='POST'&&usageMatch[2]==='quota/reset'){
+      const body=await readBody(req),latest=users.find(u=>u.uid===target.uid);if(!latest)throw new HttpError(404,'用户不存在');manageable(requireCurrentActor(req),latest);onlyFields(body,[])
+      const key=quotaPeriod()+':'+target.uid,total=state.traffic.periods[key]||{up:0,down:0}
+      persistState({...state,traffic:{...state.traffic,baselines:{...state.traffic.baselines,[key]:total.up+total.down},accessEpochs:{...state.traffic.accessEpochs,[target.uid]:crypto.randomBytes(8).toString('hex')}}})
+      send(res,200,{ok:true,usage:userUsage(latest)});return true
+    }
+  }
+  if(req.method==='GET'&&url.pathname==='/api/managed-services'){
+    requireRoot(actor);send(res,200,{services:[...managedServices.values()].map(s=>({id:s.id,ready:Boolean(serviceEpoch(s.id)),sampledAt:s.lastSampleAt,error:s.error})),gaps:state.traffic.gaps||[]});return true
+  }
+  return false
+}
 const server = http.createServer(async (req, res) => {
   try {
     const origin = req.headers.origin
@@ -403,21 +580,23 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/health') return send(res, 200, { ok: true, service: 'qaletx-link-server', time: new Date().toISOString() })
     if (req.method === 'POST' && url.pathname === '/api/login') {
       requireAttempt(req)
-      const { username, password } = await readBody(req)
+      const { username, password, device } = await readBody(req)
+      if(device!==undefined&&(!device||typeof device!=='object'||Array.isArray(device)))throw new HttpError(400,'设备信息格式无效')
       if (typeof username !== 'string' || username.length > 64 || !passwordValid(password)) throw new HttpError(400, '账号或密码格式不正确')
       const user = users.find(item => item.username === username.trim().toLowerCase())
       const correct = verifyPassword(password, user || dummyPassword)
       if (!user || !correct) throw new HttpError(401, '用户名或密码不正确')
       if (!isActive(user)) throw new HttpError(403, user.disabled ? '账号已停用，请联系管理员' : '账号已到期，请联系管理员')
-      const token = issueToken(user.username)
+      const token = issueToken(user.username,device)
       return send(res, 200, { token, user: safeUser(user) })
     }
     if (req.method === 'POST' && url.pathname === '/api/logout') {
-      sessions.delete(bearer(req))
+      const token=bearer(req),session=sessions.get(token);if(session)revokeSession(token,session)
       return send(res, 200, { ok: true })
     }
     const actor = requireCurrentActor(req)
-    if (req.method === 'GET' && url.pathname === '/api/me') return send(res, 200, { user: safeUser(actor) })
+    if(await managementRoute(req,res,url,actor))return
+    if (req.method === 'GET' && url.pathname === '/api/me') return send(res, 200, { user: safeUser(actor), capabilities:{usage:true,sessions:true,managedHysteria:managedServices.size>0} })
     if (req.method === 'POST' && url.pathname === '/api/me/password') {
       if (actor.role === 'shared') throw new HttpError(403, '共用账号不能自行修改密码，请联系管理员')
       requireAttempt(req, 'password')
@@ -440,7 +619,8 @@ const server = http.createServer(async (req, res) => {
       requireAdmin(actor)
       pruneSessions()
       const visible = users.filter(user => actor.username === 'root' || user.role !== 'admin')
-      return send(res, 200, { userCount: visible.length, activeSessions: [...sessions.values()].filter(session => visible.some(user => user.username === session.username)).length, uptime: process.uptime() })
+      return send(res, 200, { userCount: visible.length, activeSessions: [...sessions.values()].filter(session => visible.some(user => user.username === session.username)).length, uptime: process.uptime(),
+        usage:visible.map(user=>({username:user.username,...userUsage(user)})),trafficTotalBytes:Object.entries(state.traffic.periods).filter(([key])=>key.startsWith(quotaPeriod()+':')&&(actor.username==='root'||visible.some(u=>key===quotaPeriod()+':'+u.uid))).reduce((sum,[,value])=>sum+value.up+value.down,0),services:[...managedServices.values()].map(s=>({id:s.id,sampledAt:s.lastSampleAt,error:s.error})),pendingRevocations:[...pendingKicks.values()].reduce((sum,ids)=>sum+ids.size,0),gaps:state.traffic.gaps||[] })
     }
     if (req.method === 'POST' && url.pathname === '/api/users') {
       requireAdmin(actor)
@@ -454,7 +634,7 @@ const server = http.createServer(async (req, res) => {
       if (users.some(item => item.username === cleanName)) throw new HttpError(409, '账号已存在')
       requirePassword(body.password)
       const now = new Date().toISOString()
-      const record = userChanges(body, currentActor, { username: cleanName, role: 'user', ...hashPassword(body.password), privateNodeAccess: false, privateNodeIds: [], disabled: false, expiresAt: null, createdAt: now, updatedAt: now })
+      const record = userChanges(body, currentActor, { uid:crypto.randomUUID(),quotaBytes:null,username: cleanName, role: 'user', ...hashPassword(body.password), privateNodeAccess: false, privateNodeIds: [], disabled: false, expiresAt: null, createdAt: now, updatedAt: now })
       persistUsers([...users, record])
       return send(res, 201, { user: safeUser(record) })
     }
@@ -487,7 +667,9 @@ const server = http.createServer(async (req, res) => {
       if (!record) throw new HttpError(404, '用户不存在')
       manageable(currentActor, record)
       const updated = userChanges(body, currentActor, record)
-      persistUsers(users.map(user => user.username === target ? updated : user))
+      const changedGrant=record.privateNodeAccess!==updated.privateNodeAccess||[...record.privateNodeIds].sort().join(',')!==[...updated.privateNodeIds].sort().join(',')
+      const traffic=changedGrant?{...state.traffic,accessEpochs:{...state.traffic.accessEpochs,[record.uid]:crypto.randomBytes(8).toString('hex')}}:state.traffic
+      persistState({...state,traffic,users:users.map(user => user.username === target ? updated : user)})
       if (updated.role !== record.role || updated.disabled !== record.disabled || updated.expiresAt !== record.expiresAt) revokeUserSessions(target)
       return send(res, 200, { ok: true, user: safeUser(updated) })
     }
@@ -510,7 +692,7 @@ const server = http.createServer(async (req, res) => {
       const node = findNode(actor, decodeName(configMatch[1]))
       const metadata = safeNode(actor, node)
       delete metadata.uri
-      return send(res, 200, { uri: node.uri, node: metadata })
+      return send(res, 200, { uri: managedUri(req,actor,node), node: metadata })
     }
     if (req.method === 'POST' && url.pathname === '/api/nodes') {
       requirePersonal(actor)
@@ -572,7 +754,13 @@ const server = http.createServer(async (req, res) => {
       requireRoot(currentActor)
       const node = state.nodes.find(item => item.id === decodeName(privateMatch[1]) && item.private)
       if (!node) throw new HttpError(404, '私有线路不存在')
-      const updated = updateNode(node, body)
+      onlyFields(body,['name','note','revision','managedServiceId']);checkRevision(body,node)
+      let updated = 'name' in body||'note' in body ? updateNode(node,Object.fromEntries(Object.entries(body).filter(([key])=>key!=='managedServiceId'))) : {...node,revision:node.revision+1,updatedAt:new Date().toISOString()}
+      if('managedServiceId' in body){
+        if(body.managedServiceId!==null&&(!managedServices.has(body.managedServiceId)||node.protocol!=='hysteria2'))throw new HttpError(400,'只能将 Hysteria2 私有线路绑定到已配置的接管服务')
+        updated.managedServiceId=body.managedServiceId
+        if(updated.managedServiceId!==node.managedServiceId)updated.bindingEpoch=crypto.randomBytes(8).toString('hex')
+      }
       persistState({ ...state, nodes: state.nodes.map(item => item.id === node.id ? updated : item) })
       return send(res, 200, { node: safeNode(currentActor, updated) })
     }
@@ -601,7 +789,7 @@ const server = http.createServer(async (req, res) => {
     }
     throw new HttpError(404, '接口不存在')
   } catch (error) {
-    if (error instanceof HttpError) return send(res, error.status, { error: error.message })
+    if (error instanceof HttpError) return send(res, error.status, { error: error.message, ...(error.code?{code:error.code}:{}) })
     console.error('API error:', error.code || error.name)
     return send(res, 500, { error: '服务器内部错误，请查看服务日志' })
   }
@@ -615,3 +803,35 @@ server.on('error', error => {
   process.exitCode = 1
 })
 server.listen(PORT, HOST, () => console.log('qaletx link server listening on http://' + HOST + ':' + PORT))
+
+if(managedServices.size){
+  const authServer=http.createServer(async(req,res)=>{
+    let bootRequest=false
+    try{
+      const match=new URL(req.url,'http://localhost').pathname.match(/^\/(auth|boot)\/([a-z][a-z0-9_-]{0,31})$/)
+      if(req.method!=='POST'||!match||!managedServices.has(match[2]))return send(res,200,{ok:false})
+      const service=managedServices.get(match[2]),body=await readBody(req)
+      if(match[1]==='boot'){
+        bootRequest=true
+        const epoch=crypto.randomBytes(8).toString('hex')
+        persistState({...state,traffic:{...state.traffic,epochs:{...state.traffic.epochs,[service.id]:epoch},gaps:[...(state.traffic.gaps||[]),{serviceId:service.id,time:Date.now(),reason:'节点服务启动，计数器已切换代次'}].slice(-50)}})
+        service.lastSampleAt=null;service.online={};return send(res,200,{ok:true})
+      }
+      if(typeof body.auth!=='string'||body.auth.length>1024)return send(res,200,{ok:false})
+      const parts=body.auth.split('.');if(parts.length!==4||parts[0]!=='ql1')return send(res,200,{ok:false})
+      const prefix=parts.slice(0,3).join('.'),expected=crypto.createHmac('sha256',TOKEN_SECRET).update('hy2:'+prefix).digest(),supplied=Buffer.from(parts[3],'base64url')
+      if(expected.length!==supplied.length||!crypto.timingSafeEqual(expected,supplied))return send(res,200,{ok:false})
+      const session=[...sessions.values()].find(s=>s.id===parts[1]),nodeId=Buffer.from(parts[2],'base64url').toString('utf8'),node=state.nodes.find(n=>n.id===nodeId),user=users.find(u=>u.username===session?.username),epoch=serviceEpoch(service.id)
+      if(!session||session.expiresAt<=Date.now()||!isActive(user)||!epoch||!node?.private||node.managedServiceId!==service.id||!allowedNode(user,node)||userUsage(user).exceeded)return send(res,200,{ok:false})
+      if(user.quotaBytes!==null&&(!service.lastSampleAt||Date.now()-service.lastSampleAt>=30000))return send(res,200,{ok:false})
+      const period=quotaPeriod(),accessEpoch=state.traffic.accessEpochs?.[user.uid]||'initial'
+      const bindingEpoch=node.bindingEpoch||'initial',id=`q.${epoch}.${period}.${accessEpoch}.${bindingEpoch}.${session.id}.${parts[2]}`
+      if(!state.traffic.identities[id])persistState({...state,traffic:{...state.traffic,identities:{...state.traffic.identities,[id]:{sid:session.id,uid:user.uid,username:user.username,nodeId:node.id,serviceId:service.id,period,accessEpoch,bindingEpoch}}}})
+      return send(res,200,{ok:true,id})
+    }catch{return send(res,bootRequest?503:200,{ok:false})}
+  })
+  authServer.requestTimeout=5000;authServer.headersTimeout=5000
+  authServer.on('error',()=>{console.error('内部鉴权端口无法启动，请检查 MISAKA_HY2_AUTH_PORT');server.close();process.exitCode=1})
+  authServer.listen(AUTH_PORT,'127.0.0.1')
+  const poll=setInterval(()=>collectTraffic().catch(()=>{}),POLL_MS);poll.unref();collectTraffic().catch(()=>{})
+}
