@@ -11,8 +11,8 @@
     "preview": "vite preview",
     "start": "electron .",
     "server": "node server/index.cjs",
-    "dist:win": "npm run build && electron-builder --win portable nsis",
-    "dist:mac": "npm run build && electron-builder --mac dmg --universal"
+    "dist:win": "npm run build && electron-builder --win portable nsis --publish never",
+    "dist:mac": "npm run build && electron-builder --mac dmg --universal --publish never"
   },
   "build": {
     "appId": "com.misaka.link",
@@ -63,3 +63,4 @@
     "wait-on": "latest"
   }
 }
+
