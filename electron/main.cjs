@@ -67,7 +67,7 @@ function createTray() {
 }
 function createWindow() {
   mainWindow=new BrowserWindow({
-    width:960,height:640,minWidth:860,minHeight:580,show:false,
+    width:1080,height:700,minWidth:860,minHeight:580,show:false,
     title:'qaletx link',backgroundColor:'#fbf7f5',icon:asset('qaletx-link.png'),
     autoHideMenuBar:true,titleBarStyle:process.platform==='darwin'?'hiddenInset':'default',
     webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}

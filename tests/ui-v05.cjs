@@ -30,7 +30,7 @@ async function run() {
   const browser = await chromium.launch({ channel: 'msedge', headless: true })
   const errors = []
   async function fixture(account) {
-    const context = await browser.newContext({ viewport: { width: 960, height: 612 } })
+    const context = await browser.newContext({ viewport: { width: 1080, height: 664 } })
     const db = { nodes: [{ ...privateNode }, ...(account.role === 'shared' ? [] : [{ ...personalNode }])], users: [user('root', 'admin', true), user('customer', 'user'), user('shared-team', 'shared')], requests: [], conflict: false, failImport: false, failList: false }
     await context.addInitScript(({ account }) => {
       window.__ipc = []
@@ -135,7 +135,7 @@ async function run() {
     await page.setViewportSize({width:860,height:552})
     assert.ok(await page.evaluate(()=>document.querySelector('.connect-button').getBoundingClientRect().bottom<innerHeight))
     await page.screenshot({animations: 'disabled',path:path.join(output,'v06-small-dashboard.png')})
-    await page.setViewportSize({width:960,height:612})
+    await page.setViewportSize({width:1080,height:664})
     await page.evaluate(() => { window.__holdConnect = true })
     await page.getByRole('button', { name: '一键连接', exact: true }).click()
     const cancel = page.getByRole('button', { name: '取消连接', exact: true })
