@@ -12,8 +12,13 @@ const {NodeProbe}=require('./node-probe.cjs')
 const {ConnectionSession}=require('./connection-session.cjs')
 const {validProxyPort,loadProxyPort,saveProxyPort,loadPreferences,savePreferences}=require('./preferences.cjs')
 const {ConnectionController}=require('./connection-controller.cjs')
+const {AccountTransport,rendererAccountRequest}=require('./account-transport.cjs')
+const {AccountSession}=require('./account-session.cjs')
+const {NodeAddresses}=require('./node-addresses.cjs')
 if(!app.isPackaged && process.env.QALETX_TEST_PROFILE) app.setPath('userData',process.env.QALETX_TEST_PROFILE)
 let mainWindow,tray,manager,accountSession,control,quitting=false,quitReady=false,trayNodes=[]
+const accountTransport=new AccountTransport({onEvent:event=>{if(event.code||event.status>=500)manager?.log('warn',`账号请求 ${event.method} · ${event.code||'HTTP_'+event.status} · 第 ${event.attempt} 次`)}})
+const nodeAddresses=new NodeAddresses()
 const dataPath=app.getPath('userData')
 const journal=path.join(dataPath,'proxy-recovery.json')
 const preferencesFile=path.join(dataPath,'preferences.json')
@@ -107,7 +112,7 @@ else {
   app.whenReady().then(async()=>{
     Menu.setApplicationMenu(null)
     manager=new CoreManager({binary:locateCore(),directory:path.join(dataPath,'sessions'),proxy,onSpawn:guardian,proxyPort:loadProxyPort(preferencesFile)})
-    accountSession=new ConnectionSession({manager,createProbe:()=>new NodeProbe({binary:locateCore(),directory:path.join(dataPath,'probes'),onSpawn:guardian})})
+    accountSession=new ConnectionSession({manager,account:new AccountSession({transport:accountTransport}),createProbe:()=>new NodeProbe({binary:locateCore(),directory:path.join(dataPath,'probes'),onSpawn:guardian})})
     control=new ConnectionController({session:accountSession,manager,preferences,save:patch=>{savePreferences(preferencesFile,patch);preferences=loadPreferences(preferencesFile)},online:()=>electronNet.isOnline()})
     try { await proxy.restore() } catch { manager.update({phase:'error',systemProxy:true,error:'上次代理设置恢复失败，请在系统网络设置关闭代理后重试'});manager.log('error','启动时代理恢复失败') }
     const sessions=path.join(dataPath,'sessions')
@@ -115,6 +120,8 @@ else {
     handle('app:get-info',()=>({platform:process.platform,version:app.getVersion(),core:Boolean(locateCore()),coreName:'sing-box',privateNodeSource:'server',port:manager.proxyPort,tray:Boolean(tray),device:{id:preferences.deviceId,name:os.hostname().slice(0,80),platform:process.platform,version:app.getVersion()}}))
     handle('account:set-session',async credentials=>{const result=await control.setSession(credentials);trayNodes=[];updateTray();return result})
     handle('account:clear-session',async()=>{const result=await control.clearSession();trayNodes=[];updateTray();return result})
+    handle('account:request',input=>rendererAccountRequest(accountTransport,input))
+    handle('nodes:addresses',nodes=>nodeAddresses.describe(nodes))
     handle('app:get-preferences',()=>({...control.settings(),selection:control.selection()}))
     handle('app:set-preferences',patch=>control.configure(patch))
     handle('app:set-selection',payload=>{control.select(payload);updateTray();return {ok:true}})
@@ -161,6 +168,7 @@ else {
     if(quitReady) return
     event.preventDefault(); if(quitting) return
     quitting=true
+    accountTransport.close()
     if(tray){
       tray.setToolTip('qaletx link · 正在安全退出')
       tray.setContextMenu(Menu.buildFromTemplate([{label:'正在断开连接并恢复系统代理…',enabled:false}]))

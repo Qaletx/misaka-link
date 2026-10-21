@@ -1,49 +1,33 @@
-const http=require('http')
-const https=require('https')
-class AccountError extends Error {
-  constructor(message,status=0) {super(message);this.status=status}
-}
+const {AccountTransport,AccountError,accountOrigin}=require('./account-transport.cjs')
 class AccountSession {
-  constructor({timeout=10000}={}) {this.timeout=timeout;this.current=null;this.epoch=0;this.requests=new Set()}
+  constructor({timeout=12500,transport}={}) {this.transport=transport||new AccountTransport({totalTimeout:timeout,timeout:Math.min(timeout,6000)});this.current=null;this.epoch=0;this.requests=new Set()}
   clear() {
     this.epoch++;this.current=null
     this.cancelRequests('账号会话已切换')
   }
   cancelRequests(message='操作已取消') {
-    for(const request of this.requests) request.destroy(new AccountError(message))
+    for(const request of this.requests) request.abort(new AccountError(message,0,'CANCELLED'))
     this.requests.clear()
   }
   async request(credentials,route,signal) {
-    const target=new URL(route,credentials.apiUrl)
-    return new Promise((resolve,reject)=>{
-      const request=(target.protocol==='https:'?https:http).get(target,{headers:{Authorization:`Bearer ${credentials.token}`,Accept:'application/json'},agent:false,timeout:this.timeout,signal},res=>{
-        let body=''
-        res.on('data',chunk=>{body+=chunk;if(Buffer.byteLength(body)>262144)request.destroy(new AccountError('服务器响应过大'))})
-        res.on('error',()=>reject(new AccountError('服务器连接中断')))
-        res.on('end',()=>{
-          if(res.statusCode===401) return reject(new AccountError('登录已失效，请重新登录',401))
-          if(res.statusCode===403) {
-            let data={};try{data=JSON.parse(body)}catch{}
-            const error=new AccountError(data.error||'当前账号没有这条线路的使用权限',403);error.code=data.code||'ACCESS_DENIED';return reject(error)
-          }
-          if(res.statusCode===404) return reject(new AccountError('线路不存在或服务器版本过旧，请刷新线路',404))
-          if(res.statusCode!==200) return reject(new AccountError(`服务器请求失败（${res.statusCode}）`,res.statusCode))
-          try{resolve(JSON.parse(body))}catch{reject(new AccountError('服务器返回了无效数据'))}
-        })
-      })
-      this.requests.add(request)
-      request.on('close',()=>this.requests.delete(request))
-      request.on('timeout',()=>request.destroy(new AccountError('服务器请求超时，请检查网络')))
-      request.on('error',error=>reject(error instanceof AccountError?error:new AccountError('无法连接账号服务器，请检查网络')))
-    })
+    const request=new AbortController()
+    const abort=()=>request.abort(new AccountError('操作已取消',0,'CANCELLED'))
+    signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort()
+    this.requests.add(request)
+    try {
+      const response=await this.transport.request({baseUrl:credentials.apiUrl,path:route,token:credentials.token,signal:request.signal})
+      if(response.status===401)throw new AccountError('登录已失效，请重新登录',401,'AUTH_401')
+      if(response.status===403)throw new AccountError(response.data.error||'当前账号没有这条线路的使用权限',403,response.data.code||'ACCESS_DENIED')
+      if(response.status===404)throw new AccountError('线路不存在或服务器版本过旧，请刷新线路',404,'AUTH_404')
+      if(!response.ok)throw new AccountError(response.data.error||`服务器请求失败（${response.status}）`,response.status,'HTTP_'+response.status)
+      return response.data
+    }finally{signal?.removeEventListener('abort',abort);this.requests.delete(request)}
   }
   async set(credentials) {
     this.clear();const epoch=this.epoch
-    let url
-    try{url=new URL(credentials?.apiUrl)}catch{throw new AccountError('服务器地址无效')}
-    if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.search||url.hash||url.pathname!=='/') throw new AccountError('服务器地址必须是 HTTP(S) 来源地址')
+    const apiUrl=accountOrigin(credentials?.apiUrl)
     if(typeof credentials?.token!=='string'||credentials.token.length<1||credentials.token.length>4096||/[\r\n]/.test(credentials.token)) throw new AccountError('登录凭据无效')
-    const current={apiUrl:url.origin,token:credentials.token}
+    const current={apiUrl,token:credentials.token}
     const {user}=await this.request(current,'/api/me')
     if(epoch!==this.epoch) throw new AccountError('账号会话已切换')
     if(!user || !['admin','user','shared'].includes(user.role) || !user.permissions) throw new AccountError('请先更新到 0.5 版服务端，再登录新版客户端')

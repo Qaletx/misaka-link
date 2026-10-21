@@ -4,6 +4,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const http = require('node:http')
+const { NodeAddresses } = require('../electron/node-addresses.cjs')
 
 const root = path.join(__dirname, '..')
 const output = path.join(root, 'test-artifacts')
@@ -31,6 +32,8 @@ async function run() {
   const errors = []
   async function fixture(account) {
     const context = await browser.newContext({ viewport: { width: 1080, height: 664 } })
+    const addressReader = new NodeAddresses({resolve:async()=>[{address:'192.0.2.88',family:4}]})
+    await context.exposeFunction('__fixtureNodeAddresses',nodes=>addressReader.describe(nodes))
     const db = { nodes: [{ ...privateNode }, ...(account.role === 'shared' ? [] : [{ ...personalNode }])], users: [user('root', 'admin', true), user('customer', 'user'), user('shared-team', 'shared')], requests: [], conflict: false, failImport: false, failList: false }
     await context.addInitScript(({ account }) => {
       window.__ipc = []
@@ -39,15 +42,17 @@ async function run() {
       window.__emitStatus = value => { window.__status = { ...window.__status, ...value }; window.__statusListener?.(window.__status) }
       if (!localStorage.getItem('misakaAccount')) localStorage.setItem('misakaAccount', JSON.stringify({ ...account, token: `fixture-${account.username}`, apiUrl: 'http://fixture.invalid' }))
       window.misaka = {
-        setSession: async value => { window.__ipc.push({ op: 'setSession', value }); return { ok: true, user: account } },
+        setSession: async value => { window.__ipc.push({ op: 'setSession', value }); const status=sessionStorage.getItem('fixture-restore-failure');if(status){sessionStorage.removeItem('fixture-restore-failure');return {ok:false,status:Number(status),code:status==='401'?'AUTH_401':'TIMEOUT',message:status==='401'?'登录已失效，请重新登录':'账号服务暂时不可用'}}return { ok: true, user: account } },
+        accountRequest: async input => {window.__ipc.push({op:'accountRequest',path:input.path});const response=await fetch(input.baseUrl+input.path,{method:input.method,headers:{'Content-Type':'application/json',...(input.token?{Authorization:'Bearer '+input.token}:{})},body:input.body===undefined?undefined:JSON.stringify(input.body)});return{ok:response.ok,status:response.status,data:await response.json()}},
+        getNodeAddresses: nodes => {window.__ipc.push({op:'getNodeAddresses',nodes});return window.__fixtureNodeAddresses(nodes)},
         clearSession: async () => { window.__ipc.push({ op: 'clearSession' }); return { ok: true } },
-        getInfo: async () => ({ version: '0.6.0', core: true, coreName: 'sing-box', platform: 'win32' }),
+        getInfo: async () => ({ version: '0.6.2', core: true, coreName: 'sing-box', platform: 'win32' }),
         getPreferences: async () => window.__policy,
         setPreferences: async patch => {window.__policy={...window.__policy,...patch};return window.__policy},
         setSelection: async value => {window.__policy.selection=value;return {ok:true}},
         setCatalog: async () => ({ok:true}),
-        diagnose: async () => ({result:{ok:true,latencyMs:42},report:'qaletx link 0.6.0 脱敏报告\n连通性 42 ms'}),
-        diagnosticReport: async () => 'qaletx link 0.6.0 脱敏报告',
+        diagnose: async () => ({result:{ok:true,latencyMs:42},report:'qaletx link 0.6.2 脱敏报告\n连通性 42 ms'}),
+        diagnosticReport: async () => 'qaletx link 0.6.2 脱敏报告',
         getStatus: async () => window.__status,
         onStatus: callback => { window.__statusListener = callback; return () => { window.__statusListener = null } }, getLogs: async () => [],
         setProxyPort: async value => { window.__ipc.push({ op: 'setProxyPort', value }); window.__emitStatus({ port: value }); return { ok: true, port: value } },
@@ -63,8 +68,9 @@ async function run() {
       db.requests.push({ endpoint, method, body })
       let status = 200, data = { ok: true }
       const usage=username=>({username,period:'2026-10',usedBytes:2500000000,quotaBytes:username==='root'?null:100000000000,metered:true,live:true,uploadBytes:500000000,downloadBytes:2000000000,sampledAt:Date.now(),...db.quotas?.[username]})
-      const deviceValues=[{id:'fixture-current',name:'我的电脑',platform:'win32',version:'0.6.0',lastSeenAt:Date.now(),current:true,proxyOnline:true},{id:'fixture-other',name:'备用电脑',platform:'darwin',version:'0.6.0',lastSeenAt:Date.now(),current:false,proxyOnline:false}].filter(s=>!db.removed?.includes(s.id))
-      if (endpoint === '/api/me') data = { user: account }
+      const deviceValues=[{id:'fixture-current',name:'我的电脑',platform:'win32',version:'0.6.2',lastSeenAt:Date.now(),current:true,proxyOnline:true},{id:'fixture-other',name:'备用电脑',platform:'darwin',version:'0.6.2',lastSeenAt:Date.now(),current:false,proxyOnline:false}].filter(s=>!db.removed?.includes(s.id))
+      if (endpoint === '/api/login') data = {user:account,token:`fixture-${account.username}`}
+      else if (endpoint === '/api/me') data = { user: account }
       else if(endpoint==='/api/me/usage')data={usage:usage(account.username)}
       else if(endpoint==='/api/me/sessions'||/^\/api\/users\/[^/]+\/sessions$/.test(endpoint))data={sessions:account.role==='shared'?deviceValues.filter(s=>s.current):deviceValues}
       else if(/^\/api\/sessions\//.test(endpoint)&&method==='DELETE'){db.removed=[...(db.removed||[]),endpoint.split('/').pop()];data={ok:true}}
@@ -147,6 +153,10 @@ async function run() {
     await page.getByRole('button', { name: '我的线路', exact: false }).click()
     const dialog = page.getByRole('dialog')
     const privateRow = dialog.locator('.node-card').filter({ hasText: '专属主线路' })
+    assert.equal(await privateRow.locator('.node-address').count(),0)
+    await dialog.locator('.node-card').filter({hasText:'我的备用线路'}).locator('.node-address').getByText('127.0.0.1:19999',{exact:true}).waitFor()
+    assert.ok((await page.evaluate(()=>window.__ipc)).filter(x=>x.op==='getNodeAddresses').every(x=>x.nodes.every(node=>!node.private&&!node.id.startsWith('private'))))
+    await page.screenshot({animations:'disabled',path:path.join(output,'v062-node-addresses.png')})
     assert.equal(await privateRow.getByRole('button', { name: '复制链接', exact: true }).count(), 0)
     await privateRow.getByRole('button', { name: '测试 专属主线路 连通性' }).click()
     await privateRow.getByText('42 ms', { exact: true }).waitFor()
@@ -286,6 +296,25 @@ async function run() {
     await delegated.page.getByRole('button', { name: '创建账号', exact: true }).click()
     assert.equal(await delegated.page.locator('option[value="admin"]').count(), 0)
     await delegated.context.close()
+
+    const recovering=await fixture(user('recovering','user'))
+    await recovering.page.evaluate(()=>sessionStorage.setItem('fixture-restore-failure','0'))
+    await recovering.page.reload()
+    await recovering.page.getByRole('button',{name:'重试连接',exact:true}).waitFor()
+    assert.ok(await recovering.page.evaluate(()=>JSON.parse(localStorage.getItem('misakaAccount')).token))
+    await recovering.page.screenshot({animations:'disabled',path:path.join(output,'v062-login-retry.png')})
+    await recovering.page.getByRole('button',{name:'重试连接',exact:true}).click()
+    await recovering.page.locator('.connect-button').waitFor()
+    await recovering.page.evaluate(()=>sessionStorage.setItem('fixture-restore-failure','401'))
+    await recovering.page.reload()
+    await recovering.page.getByRole('button',{name:'登录并开始',exact:true}).waitFor()
+    assert.equal(await recovering.page.evaluate(()=>localStorage.getItem('misakaAccount')),null)
+    await recovering.page.getByLabel('账号',{exact:true}).fill('recovering')
+    await recovering.page.getByLabel('密码',{exact:true}).fill('fixture-password-only')
+    await recovering.page.getByRole('button',{name:'登录并开始',exact:true}).click()
+    await recovering.page.locator('.connect-button').waitFor()
+    assert.ok((await recovering.page.evaluate(()=>window.__ipc)).some(x=>x.op==='accountRequest'&&x.path==='/api/login'))
+    await recovering.context.close()
     assert.deepEqual(errors, [])
     console.log(JSON.stringify({ rendererV05: 'passed', roles: ['root', 'admin', 'user', 'shared'], checks: ['compact-layout', 'session-initialization', 'private-no-export', 'measured-latency', 'cloud-rename-note', 'revision-conflict-preserves-input', 'private-conversion', 'private-assignment', 'shared-creation', 'private-master-switch', 'shared-no-password', 'shared-local-only', 'cloud-failure-preserves-input', 'cloud-reload-sync', 'admin-cannot-create-admin', 'private-uri-single-and-valid', 'stale-grant-filter', 'legacy-no-auto-upload', 'empty-authorized-list', 'route-choice-confirmation', 'connected-route-switch', 'custom-proxy-port'], systemProxyModified: false }))
   } finally { await browser.close(); await new Promise(resolve => server.close(resolve)) }

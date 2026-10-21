@@ -34,6 +34,8 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Verify account transport and route addresses
+        run: node --test tests/account-transport.test.cjs tests/node-addresses.test.cjs
       - name: Download sing-box cores
         shell: bash
         run: |
@@ -49,6 +51,15 @@ jobs:
           chmod +x core/sing-box-amd64 core/sing-box-arm64
       - name: Build universal DMG
         run: npm run dist:mac
+      - name: Verify universal architectures and disk image
+        run: |
+          lipo -archs "release/mac-universal/qaletx link.app/Contents/MacOS/qaletx link" | grep -q x86_64
+          lipo -archs "release/mac-universal/qaletx link.app/Contents/MacOS/qaletx link" | grep -q arm64
+          hdiutil verify release/*.dmg
+      - name: Test packaged Mac account login and address display
+        env:
+          QALETX_PACKAGED_EXE: release/mac-universal/qaletx link.app/Contents/MacOS/qaletx link
+        run: node tests/account-desktop-smoke.cjs
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -56,4 +67,5 @@ jobs:
           path: |
             release/*.dmg
             release/*.zip
+            test-artifacts/v062-native-darwin.json
           if-no-files-found: error

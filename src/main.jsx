@@ -81,9 +81,21 @@ function Dashboard({ account, onLogout }) {
   const storageKey = accountStorage(account, 'nodes')
   const notesKey = accountStorage(account, 'annotations')
   const [cloudNodes, setCloudNodes] = useState([])
+  const [nodeAddresses, setNodeAddresses] = useState({})
   const [localNodes, setLocalNodes] = useState(() => shared ? scopedNodes(storageKey) : [])
   const [localNotes, setLocalNotes] = useState(() => shared ? readLocal(notesKey, {}) : {})
   const nodes = useMemo(() => [...cloudNodes.map((node) => shared && node.private ? { ...node, ...localNotes[node.id] } : node), ...(shared ? localNodes : [])], [cloudNodes, shared, localNodes, localNotes])
+  useEffect(() => {
+    let cancelled = false
+    const personal = nodes.filter(node => !node.private).map(({id, uri}) => ({id, uri, private: false}))
+    setNodeAddresses({})
+    if (personal.length && window.misaka?.getNodeAddresses) {
+      window.misaka.getNodeAddresses(personal).then(items => {
+        if (!cancelled) setNodeAddresses(Object.fromEntries(items.map(item => [item.id, item])))
+      }).catch(() => {})
+    }
+    return () => { cancelled = true }
+  }, [nodes])
   const [selected, setSelected] = useState('')
   const [pendingSelected, setPendingSelected] = useState('')
   const [status, setStatus] = useState(INITIAL_STATUS)
@@ -406,9 +418,13 @@ function Dashboard({ account, onLogout }) {
     if (!node) return <div className="empty-node"><Icon name="globe" size={25}/><div><strong>{syncState.loading ? '正在获取你的线路…' : '还没有可用线路'}</strong><p>{syncState.error || '导入个人线路，或请管理员分配私有线路。'}</p></div><button className="text-button" onClick={() => setPanel('import')}>导入线路</button></div>
     const checked = (tools ? pendingSelected || activeNode?.id : activeNode?.id) === node.id
     const test = tests[node.id]
+    const address = !node.private ? nodeAddresses[node.id] : null
+    const endpoint = address?.server ? `${address.server.includes(':') ? `[${address.server}]` : address.server}:${address.port}` : ''
+    const resolvedIps = address?.ips?.filter(ip => ip !== address.server) || []
     const testLabel = test?.busy ? '测试中' : test?.ok && Number.isFinite(test.latencyMs) ? `${test.latencyMs} ms` : !test ? '测试延迟' : /正在测试其他/.test(test.message || '') ? '稍后再试' : /取消/.test(test.message || '') ? '已取消' : /超时/.test(test.message || '') ? '测试超时' : /无法连通/.test(test.message || '') ? '未连通' : '测试失败'
     return <div className={`node-row node-card ${checked ? 'selected' : ''}`} key={node.id}>
       <div className="node-heading"><button className="node-select" aria-pressed={checked} onClick={() => chooseNode(node)} disabled={busy}><span className={`node-symbol ${node.private ? 'managed' : ''}`}><Icon name={node.private ? 'shield' : 'globe'} size={19}/></span><span className="node-main"><strong>{node.name}</strong><small>{node.protocol} <span>·</span> {node.private ? '私有线路' : node.local ? '仅本机' : '账号云同步'}</small></span><span className="node-tag">{node.private ? <><Icon name="lock" size={11}/>私有</> : <Icon name={node.local ? 'user' : 'cloud'} size={13}/>}</span><span className={`radio ${checked ? 'checked' : ''}`}>{checked && <Icon name="check" size={10}/>}</span></button><button className={`probe-button ${test?.ok ? 'reachable' : test && !test.busy ? 'unreachable' : ''}`} disabled={test?.busy} title={test?.message || '测试线路连通性与实际请求延迟，不改变当前连接'} aria-label={`测试 ${node.name} 连通性`} onClick={() => testNode(node)}>{test?.busy ? <span className="spinner"/> : <Icon name="pulse" size={14}/>}<span>{testLabel}</span></button></div>
+      {!node.private && <div className="node-address" aria-label={`${node.name} 服务器地址`}><Icon name="globe" size={11}/><span>{endpoint || (address?.unavailable ? '地址暂不可用，请检查线路链接' : '正在读取地址…')}</span>{resolvedIps.length > 0 && <span className="resolved-ips" title={resolvedIps.join(' · ')}>IP {resolvedIps.join(' · ')}</span>}</div>}
       {node.note && <p className="node-note">{node.note}</p>}
       {tools && test && !test.busy && !test.ok && <p className="node-test-error" role="status">{test.message || '测试未完成，请重试'}</p>}
       {tools && <div className="node-tool-row"><button className="text-button" onClick={() => editNode(node)}><Icon name="edit" size={12}/>名称与备注</button>{!node.private && <button className="text-button" onClick={() => copyNode(node)}><Icon name="copy" size={12}/>复制链接</button>}{root && <button className="text-button" onClick={() => node.private ? openAssignment(node) : newPrivate(node)}><Icon name={node.private ? 'users' : 'shield'} size={12}/>{node.private ? '分配用户' : '设为私有'}</button>}{root && node.private && node.protocol?.toLowerCase() === 'hysteria2' && <button className="text-button" onClick={() => { setMeterNode(node); setPanel('meter') }}><Icon name="shield" size={12}/>{node.metered ? '管理接管' : '服务端接管'}</button>}{(!node.private || root) && <button className="text-button danger" disabled={status.nodeId === node.id && (connected || busy)} onClick={() => { setDeleteTarget({ kind: 'node', node }); setPanel('delete') }}><Icon name="trash" size={12}/>移除</button>}</div>}
@@ -454,6 +470,8 @@ function App() {
   const [account, setAccount] = useState(() => { const saved = readLocal('misakaAccount', null); return saved?.token && typeof saved.username === 'string' ? saved : null })
   const [readyToken, setReadyToken] = useState(null)
   const [message, setMessage] = useState('')
+  const [restoreError, setRestoreError] = useState('')
+  const [restoreAttempt, setRestoreAttempt] = useState(0)
   const accountRef = useRef(account)
   const logoutPromise = useRef(null)
   accountRef.current = account
@@ -473,7 +491,7 @@ function App() {
   const login = async (next) => {
     if (!window.misaka?.setSession) throw new Error('请使用新版桌面客户端登录')
     const result = await window.misaka.setSession({ apiUrl: next.apiUrl, token: next.token })
-    if (!result?.ok) throw new Error(result?.message || '客户端会话初始化失败，请重试')
+    if (!result?.ok) throw Object.assign(new Error(result?.message || '客户端会话初始化失败，请重试'), {status: result?.status, code: result?.code})
     const verified = { ...next, ...result.user }
     localStorage.setItem('misakaAccount', JSON.stringify(verified)); setMessage(''); setReadyToken(next.token); setAccount(verified)
   }
@@ -481,15 +499,21 @@ function App() {
     if (!account?.token || readyToken === account.token) return
     let cancelled = false
     const initialize = async () => {
+      setRestoreError('')
       try {
         if (!window.misaka?.setSession) throw new Error('请使用新版桌面客户端登录')
         const result = await window.misaka.setSession({ apiUrl: account.apiUrl, token: account.token })
-        if (!result?.ok) throw new Error(result?.message || '无法验证登录，请重新登录')
+        if (!result?.ok) throw Object.assign(new Error(result?.message || '无法验证登录，请重新登录'), {status: result?.status, code: result?.code})
         if (!cancelled) { const verified = { ...account, ...result.user }; localStorage.setItem('misakaAccount', JSON.stringify(verified)); setAccount(verified); setReadyToken(account.token) }
-      } catch (error) { if (!cancelled) { await Promise.resolve(window.misaka?.clearSession?.()).catch(() => {}); localStorage.removeItem('misakaAccount'); setAccount(null); setMessage(error.message) } }
+      } catch (error) {
+        if (!cancelled) {
+          if ([401,403].includes(error.status)) { await Promise.resolve(window.misaka?.clearSession?.()).catch(() => {}); localStorage.removeItem('misakaAccount'); setAccount(null); setMessage(error.message) }
+          else setRestoreError(error.message || '账号服务暂时不可用，请重试')
+        }
+      }
     }
     initialize(); return () => { cancelled = true }
-  }, [account?.token, readyToken])
+  }, [account?.token, readyToken, restoreAttempt])
   useEffect(() => {
     if (!account?.token || readyToken !== account.token) return
     const expired = (event) => { if (event.detail?.token === accountRef.current?.token) logout(true).catch(() => {}) }
@@ -504,7 +528,7 @@ function App() {
     return () => { window.removeEventListener('qaletx-session-expired', expired); clearInterval(timer) }
   }, [account?.token, account?.apiUrl, readyToken, logout])
   if (!account) return <LoginScreen message={message} onLogin={login}/>
-  if (readyToken !== account.token) return <main className="login-shell"><section className="login-card boot-card"><Brand/><span className="spinner"/><p>正在验证账号并准备线路…</p></section></main>
+  if (readyToken !== account.token) return <main className="login-shell"><section className="login-card boot-card"><Brand/>{restoreError ? <><p className="form-error" role="alert">{restoreError}</p><p>已保留登录信息，网络恢复后可以直接重试。</p><div className="restore-actions"><button className="secondary-button" onClick={() => logout(true)}>返回登录</button><button className="primary-button" onClick={() => setRestoreAttempt(value => value + 1)}><Icon name="refresh" size={14}/>重试连接</button></div></> : <><span className="spinner"/><p>正在验证账号并准备线路…</p></>}</section></main>
   return <Dashboard key={`${account.apiUrl}:${account.username}:${account.token}`} account={account} onLogout={() => logout(false)}/>
 }
 
@@ -533,12 +557,22 @@ async function apiFetch(pathname, { baseUrl, token, method = 'GET', body } = {})
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 10000)
   try {
-    const response = await fetch(`${root}${pathname}`, { method, signal: controller.signal, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) })
-    let data = {}
-    try { data = await response.json() } catch { if (controller.signal.aborted) throw new Error('请求超时，请检查网络后重试') }
-    if (response.status === 401 && token) window.dispatchEvent(new CustomEvent('qaletx-session-expired', { detail: { token } }))
-    return { ok: response.ok, status: response.status, data }
+    let result
+    if (window.misaka?.accountRequest) {
+      clearTimeout(timer)
+      result = await window.misaka.accountRequest({baseUrl:root,path:pathname,method,token,body})
+      if (result.transportError) throw Object.assign(new Error(result.message), {code:result.code,status:result.status})
+    } else {
+      // Browser-only development preview. Installed desktop clients always
+      // use the main-process direct transport, including POST /api/login.
+      const response = await fetch(`${root}${pathname}`, { method, signal: controller.signal, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) })
+      const data = await response.json()
+      result = {ok:response.ok,status:response.status,data}
+    }
+    if (result.status === 401 && token) window.dispatchEvent(new CustomEvent('qaletx-session-expired', { detail: { token } }))
+    return result
   } catch (error) {
+    if (error.code) throw error
     if (controller.signal.aborted) throw new Error('请求超时，请检查网络后重试')
     throw new Error('无法连接账号服务，请检查网络或联系管理员')
   } finally { clearTimeout(timer) }

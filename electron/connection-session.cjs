@@ -24,7 +24,7 @@ class ConnectionSession {
         if(generation!==this.generation)return {ok:false,message:'账号会话已切换'}
         this.probe=this.createProbe()
         return {ok:true,user}
-      }catch(error){return {ok:false,message:error.message}}
+      }catch(error){return {ok:false,message:error.message,status:error.status||0,code:error.code||'NETWORK'}}
     }
     const result=this.mutations.then(task,task);this.mutations=result.catch(()=>{});return result
   }

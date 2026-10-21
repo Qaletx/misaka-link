@@ -115,3 +115,9 @@ textarea{font-size:12.5px}.stack-form h3,.settings-section h3{font-size:15.5px}.
 .brand small{white-space:nowrap;font-size:8px;letter-spacing:.07em}
 .nav-item>span,.sidebar-account small{white-space:nowrap}.sidebar-account{gap:7px;padding-left:3px;padding-right:3px}
 @media(max-width:900px){.nav-item small{display:none}}
+
+/* Personal endpoint details stay quiet; private routes have no address row. */
+.node-address{display:flex;align-items:center;flex-wrap:wrap;gap:5px 9px;padding:0 13px 11px 59px;font:11.5px/1.55 var(--mono);color:#8e7567;overflow-wrap:anywhere;user-select:text}
+.node-address>span{min-width:0;max-width:100%}.node-address .resolved-ips{font-size:10.5px;color:#9b8577}
+.restore-actions{display:flex;justify-content:center;gap:9px;margin-top:20px}
+@media(max-width:900px){.node-address{padding-left:56px}}
