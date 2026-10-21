@@ -31,7 +31,7 @@ async function run() {
   let app
   try {
     app = await _electron.launch({ executablePath: packed || require('electron'), args: packed ? [`--user-data-dir=${profile}`] : [root], env, timeout: 30000 })
-    assert.equal(path.resolve(await app.evaluate(({ app }) => app.getPath('userData'))), path.resolve(profile))
+    assert.equal(fs.realpathSync(await app.evaluate(({ app }) => app.getPath('userData'))), fs.realpathSync(profile))
     const page = await app.firstWindow(); page.setDefaultTimeout(15000)
     await page.getByRole('button', { name: '登录并开始' }).waitFor()
     const errors = []; page.on('pageerror', error => errors.push(error.message))
