@@ -80,7 +80,24 @@ async function fixture(t, options = {}) {
       ...(body !== undefined ? { body: typeof body === 'string' ? body : JSON.stringify(body) } : {}),
       signal: AbortSignal.timeout(5000)
     })
-    return { status: response.status, headers: response.headers, body: response.status === 204 ? null : await response.json() }
+    const result = { status: response.status, headers: response.headers, body: response.status === 204 ? null : await response.json() }
+    // The remote process may finish its response after the client receives
+    // bytes. Wait for that lifecycle event before inspecting persisted logs.
+    const requestId = response.headers.get('x-qaletx-request-id')
+    if (requestId) {
+      const logDirectory = path.join(directory, 'logs')
+      let recorded = false
+      for (let attempt = 0; attempt < 200; attempt++) {
+        try {
+          if (fs.statSync(logDirectory).isDirectory()) recorded = fs.readdirSync(logDirectory).filter(name => /^login-\d{4}-\d{2}-\d{2}\.jsonl$/.test(name)).some(name => fs.readFileSync(path.join(logDirectory, name), 'utf8').includes(requestId))
+          else recorded = output.includes(requestId)
+        } catch {}
+        if (recorded) break
+        await delay(5)
+      }
+      assert.equal(recorded, true, 'Login response must have a matching file or fallback audit record')
+    }
+    return result
   }
   async function login(username = 'root', password = ROOT_PASSWORD) {
     const response = await request('POST', '/api/login', { username, password })
@@ -237,6 +254,10 @@ test('untrusted X-Forwarded-For cannot bypass login rate limit', async t => {
   const limited = await app.request('POST', '/api/login', { username: 'root', password: ROOT_PASSWORD }, undefined, { 'X-Forwarded-For': '192.0.2.100' })
   assert.equal(limited.status, 429)
   assert.equal(limited.headers.get('retry-after'), '600')
+  const audits = readLoginAudits(app)
+  const event = audits.find(item => item.requestId === limited.headers.get('x-qaletx-request-id'))
+  assert.equal(event.reasonCode, 'RATE_LIMITED'); assert.equal(event.clientIp, '127.0.0.1')
+  assert.equal(event.authentication, 'not_checked')
   assert.equal((await app.request('GET', '/api/health')).status, 200)
 })
 
@@ -250,6 +271,8 @@ test('trusted reverse proxy walks forwarding chain from the rightmost untrusted 
     { 'X-Forwarded-For': '203.0.113.99, 192.0.2.50' })).status, 429)
   assert.equal((await app.request('POST', '/api/login', { username: 'root', password: ROOT_PASSWORD }, undefined,
     { 'X-Forwarded-For': '192.0.2.51' })).status, 200)
+  const success = readLoginAudits(app).find(item => item.result === 'success')
+  assert.equal(success.clientIp, '192.0.2.51'); assert.equal(success.peerIp, '127.0.0.1'); assert.equal(success.trustedProxy, true)
 })
 
 test('only 10 recent sessions per account stay valid', async t => {
@@ -657,4 +680,102 @@ test('device metadata is safe, ordinary users cannot revoke another user, and sh
   await createUser(app,root,'shareddevices','shared');const first=await app.login('shareddevices',NEW_PASSWORD),second=await app.login('shareddevices',NEW_PASSWORD)
   const one=(await app.request('GET','/api/me/sessions',undefined,first)).body.sessions,other=(await app.request('GET','/api/me/sessions',undefined,second)).body.sessions
   assert.equal(one.length,1);assert.equal((await app.request('DELETE',`/api/sessions/${other[0].id}`,undefined,first)).status,403)
+})
+
+function readLoginAudits(app) {
+  const directory = path.join(app.directory, 'logs')
+  if (!fs.existsSync(directory)) return []
+  return fs.readdirSync(directory).filter(name => /^login-.*\.jsonl$/.test(name)).flatMap(name => fs.readFileSync(path.join(directory, name), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)))
+}
+
+test('login audit persists successful computer identity, trusted IP metadata and a correlatable request ID without credentials', async t => {
+  const app = await fixture(t)
+  await app.request('GET','/api/health')
+  assert.deepEqual(readLoginAudits(app), [])
+  const response = await app.request('POST','/api/login',{username:' USER ',password:USER_PASSWORD,device:{id:'fixture_device_123',name:'客户 Windows 电脑',platform:'win32',version:'0.6.2'}},undefined,{'User-Agent':'qaletx-test-client','X-Forwarded-For':'203.0.113.123'})
+  assert.equal(response.status,200)
+  const records = readLoginAudits(app); assert.equal(records.length,1)
+  const entry = records[0]
+  assert.equal(entry.username,'user');assert.equal(entry.deviceName,'客户 Windows 电脑');assert.equal(entry.platform,'win32');assert.equal(entry.clientVersion,'0.6.2');assert.equal(entry.deviceId,'fixture_device_123')
+  assert.equal(entry.clientIp,'127.0.0.1');assert.equal(entry.trustedProxy,false);assert.equal(entry.userAgent,'qaletx-test-client')
+  assert.equal(entry.result,'success');assert.equal(entry.authentication,'success');assert.equal(entry.reasonCode,'SUCCESS');assert.equal(entry.httpStatus,200);assert.equal(entry.responseFinished,true)
+  assert.equal(entry.requestId,response.headers.get('x-qaletx-request-id'));assert.match(entry.beijingTime,/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\+08:00$/)
+  assert.ok(entry.inputHints.includes('USERNAME_OUTER_WHITESPACE'))
+  const text = JSON.stringify(records) + app.logs()
+  for(const secret of [USER_PASSWORD,ROOT_PASSWORD,response.body.token,JSON.parse(fs.readFileSync(path.join(app.directory,'data/state.json'),'utf8')).users[0].hash])assert.equal(text.includes(secret),false)
+  assert.equal((await app.request('GET','/logs/login-'+entry.beijingTime.slice(0,10)+'.jsonl')).status,401)
+})
+
+test('password mismatch and unknown account have distinct private audit reasons but the same public error',async t=>{
+  const app=await fixture(t), wrong='AuditWrongPassword-Only-2026!'
+  const first=await app.request('POST','/api/login',{username:'user',password:wrong,device:{id:'bad_device_123',name:'PC\n'+wrong,platform:'win32',version:'0.6.1'}},undefined,{'Authorization':'Bearer NeverLogThisAuthorization','User-Agent':'Electron Bearer NeverLogThisUserAgent'})
+  const second=await app.request('POST','/api/login',{username:'missing-user',password:' AnotherWrongPassword-2026! ',device:{name:'Mac 客户电脑',platform:'darwin',version:'0.6.2'}})
+  assert.equal(first.status,401);assert.equal(second.status,401);assert.equal(first.body.error,second.body.error)
+  assert.equal(first.body.code,undefined);assert.equal(second.body.code,undefined)
+  const records=readLoginAudits(app);assert.equal(records.length,2)
+  const one=records.find(x=>x.requestId===first.body.requestId), two=records.find(x=>x.requestId===second.body.requestId)
+  assert.equal(one.reasonCode,'BAD_PASSWORD');assert.equal(two.reasonCode,'ACCOUNT_NOT_FOUND')
+  assert.equal(one.authentication,'failure');assert.equal(two.result,'failure');assert.notEqual(one.requestId,two.requestId)
+  assert.equal(one.deviceName.includes('\n'),false);assert.ok(two.inputHints.includes('PASSWORD_OUTER_WHITESPACE'))
+  const serialized=JSON.stringify(records)+app.logs()
+  for(const secret of [wrong,'AnotherWrongPassword-2026!','NeverLogThisAuthorization','NeverLogThisUserAgent'])assert.equal(serialized.includes(secret),false)
+})
+
+test('disabled and expired accounts record the actual access restriction',async t=>{
+  const app=await fixture(t),root=await app.login()
+  await app.request('POST','/api/users',{username:'disabled-audit',password:NEW_PASSWORD,disabled:true},root)
+  await app.request('POST','/api/users',{username:'expired-audit',password:NEW_PASSWORD,expiresAt:'2020-01-01T00:00:00Z'},root)
+  assert.equal((await app.request('POST','/api/login',{username:'disabled-audit',password:NEW_PASSWORD})).status,403)
+  assert.equal((await app.request('POST','/api/login',{username:'expired-audit',password:NEW_PASSWORD})).status,403)
+  const records=readLoginAudits(app)
+  assert.equal(records.find(x=>x.username==='disabled-audit').reasonCode,'ACCOUNT_DISABLED')
+  assert.equal(records.find(x=>x.username==='expired-audit').reasonCode,'ACCOUNT_EXPIRED')
+})
+
+test('audit distinguishes malformed input, oversized bodies, preflight and CORS without storing raw payloads',async t=>{
+  const app=await fixture(t)
+  assert.equal((await app.request('POST','/api/login','{"password":"NeverPersistMalformedSecret')).status,400)
+  assert.equal((await app.request('POST','/api/login',{username:'user',password:'tiny'})).status,400)
+  assert.equal((await app.request('POST','/api/login',{username:'user',password:USER_PASSWORD,device:'invalid'})).status,400)
+  assert.equal((await app.request('POST','/api/login',{username:'user',password:'oversized-not-recorded-'.repeat(5000)})).status,413)
+  assert.equal((await app.request('OPTIONS','/api/login',undefined,undefined,{Origin:'null'})).status,204)
+  assert.equal((await app.request('POST','/api/login',{username:'user',password:USER_PASSWORD},undefined,{Origin:'https://untrusted.example'})).status,403)
+  await app.request('GET','/api/login')
+  const records=readLoginAudits(app),codes=records.map(x=>x.reasonCode)
+  assert.deepEqual(codes.sort(),['INVALID_JSON','INVALID_INPUT','INVALID_DEVICE','BODY_TOO_LARGE','PREFLIGHT_OK','CORS_BLOCKED','METHOD_NOT_ALLOWED'].sort())
+  const preflight=records.find(x=>x.event==='login_preflight');assert.equal(preflight.authentication,'not_checked');assert.equal(preflight.reasonCode,'PREFLIGHT_OK')
+  const cors=records.find(x=>x.reasonCode==='CORS_BLOCKED');assert.equal(cors.deviceReported,false);assert.equal(cors.authentication,'not_checked')
+  assert.equal(JSON.stringify(records).includes('NeverPersistMalformedSecret'),false);assert.equal(app.logs().includes('oversized-not-recorded-'),false)
+})
+
+test('an interrupted login body creates one failed audit record with the original socket address',async t=>{
+  const app=await fixture(t)
+  const socket=net.connect(app.port,'127.0.0.1')
+  await once(socket,'connect');socket.write('POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 300\r\n\r\n{"username":"user",')
+  await delay(20);socket.destroy()
+  for(let n=0;n<100&&!readLoginAudits(app).length;n++)await delay(10)
+  const records=readLoginAudits(app);assert.equal(records.length,1)
+  assert.ok(['REQUEST_ABORTED','CLIENT_DISCONNECTED'].includes(records[0].reasonCode));assert.equal(records[0].responseFinished,false);assert.equal(records[0].clientIp,'127.0.0.1')
+  assert.equal((await app.request('GET','/api/health')).status,200)
+})
+
+test('audit rotation caps each day and prunes only expired login files',async t=>{
+  const day=new Date(Date.now()+8*3600000).toISOString().slice(0,10)
+  const app=await fixture(t,{prepare(directory){const logs=path.join(directory,'logs');fs.mkdirSync(logs);fs.writeFileSync(path.join(logs,'login-'+day+'.jsonl'),Buffer.alloc(5*1024*1024,32));fs.writeFileSync(path.join(logs,'login-'+day+'.1.jsonl'),'previous');fs.writeFileSync(path.join(logs,'login-'+day+'.2.jsonl'),'oldest');fs.writeFileSync(path.join(logs,'login-2000-01-01.jsonl'),'expired');fs.writeFileSync(path.join(logs,'keep-this.txt'),'preserve')}})
+  await app.login()
+  const directory=path.join(app.directory,'logs'),files=fs.readdirSync(directory)
+  assert.ok(!files.includes('login-2000-01-01.jsonl'));assert.ok(files.includes('keep-this.txt'))
+  assert.equal(files.filter(x=>x.endsWith('.jsonl')).length,3)
+  assert.equal(fs.statSync(path.join(directory,'login-'+day+'.1.jsonl')).size,5*1024*1024)
+  assert.equal(fs.readFileSync(path.join(directory,'login-'+day+'.2.jsonl'),'utf8'),'previous')
+  const current=JSON.parse(fs.readFileSync(path.join(directory,'login-'+day+'.jsonl'),'utf8').trim());assert.equal(current.reasonCode,'SUCCESS')
+})
+
+test('audit disk failure remains visible in PM2 output and never breaks authentication',async t=>{
+  const app=await fixture(t,{prepare(directory){fs.writeFileSync(path.join(directory,'logs'),'not-a-directory')}})
+  const response=await app.request('POST','/api/login',{username:'user',password:USER_PASSWORD})
+  assert.equal(response.status,200)
+  await delay(20)
+  assert.match(app.logs(),/LOGIN_AUDIT_WRITE_FAILED/);assert.match(app.logs(),/"reasonCode":"SUCCESS"/)
+  assert.equal(app.logs().includes(USER_PASSWORD),false);assert.equal(app.logs().includes(response.body.token),false)
 })

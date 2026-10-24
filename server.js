@@ -47,6 +47,16 @@ const MAX_RATE_ENTRIES = 10000
 const MAX_SESSIONS = 10000
 const MAX_USER_SESSIONS = 10
 const MAX_SHARED_SESSIONS = 200
+const LOGIN_LOG_DIR = path.join(__dirname, 'logs')
+function logSetting(name, fallback, max) {
+  const value = process.env[name] || String(fallback)
+  if (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > max) throw new Error(name + ' 必须是 1-' + max + ' 的整数')
+  return Number(value)
+}
+const LOGIN_LOG_DAYS = logSetting('MISAKA_LOGIN_LOG_RETENTION_DAYS', 30, 365)
+const LOGIN_LOG_BYTES = logSetting('MISAKA_LOGIN_LOG_MAX_MB', 5, 50) * 1024 * 1024
+const LOGIN_LOG_FILES = logSetting('MISAKA_LOGIN_LOG_FILES_PER_DAY', 3, 10)
+let lastLoginLogPrune = '', lastLoginLogWarning = 0
 
 function normalizeAddress(address) { return address.startsWith('::ffff:') ? address.slice(7) : address }
 const TRUSTED_PROXIES = new Set((process.env.MISAKA_TRUSTED_PROXIES || '').split(',')
@@ -236,6 +246,124 @@ function clientAddress(req) {
   for (let index = chain.length - 1; index >= 0 && TRUSTED_PROXIES.has(address); index -= 1) address = chain[index]
   return address
 }
+
+// Deliberately whitelist metadata: never serialize request bodies, passwords,
+// Authorization headers, tokens, session IDs, salts or password hashes.
+const LOGIN_REASONS = {
+  SUCCESS: '账号和密码验证成功',
+  BAD_PASSWORD: '密码不匹配',
+  ACCOUNT_NOT_FOUND: '账号不存在',
+  ACCOUNT_DISABLED: '账号已停用',
+  ACCOUNT_EXPIRED: '账号已过期',
+  RATE_LIMITED: '来源 IP 登录尝试过多，已限流',
+  INVALID_INPUT: '账号或密码格式无效',
+  INVALID_DEVICE: '客户端设备信息格式无效',
+  INVALID_JSON: '请求体不是有效的 JSON 对象',
+  BODY_TOO_LARGE: '请求体超过 64 KiB',
+  BODY_READ_ERROR: '读取登录请求失败',
+  REQUEST_ABORTED: '客户端在发送请求时中断连接',
+  CLIENT_DISCONNECTED: '客户端在收到完整响应前断开连接',
+  CORS_BLOCKED: '浏览器 Origin 不在服务端允许列表中',
+  PREFLIGHT_OK: '浏览器预检通过，尚未校验账号密码',
+  METHOD_NOT_ALLOWED: '客户端使用了不支持的登录请求方法',
+  SESSION_LIMIT: '服务器登录会话数量已达上限',
+  INTERNAL_ERROR: '服务器内部错误，请结合 PM2 错误日志排查',
+  REQUEST_REJECTED: '服务器拒绝了登录请求',
+}
+function beijingTime(now) { return new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(0, 19).replace('T', ' ') + '+08:00' }
+function auditText(value, max = 200, secret = '') {
+  if (typeof value !== 'string') return ''
+  let result = value
+  if (secret.length >= 4) result = result.split(secret).join('[已隐藏]')
+  return result.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, '')
+    .replace(/Bearer\s+[^\s,;]+/gi, 'Bearer [已隐藏]').slice(0, max)
+}
+function writeLoginAudit(record) {
+  const line = JSON.stringify(record) + '\n'
+  // PM2 and the panel already capture stdout, so the same request ID is
+  // searchable there even if disk permissions prevent the JSONL copy.
+  console.log('LOGIN_AUDIT ' + line.trimEnd())
+  try {
+    const day = record.beijingTime.slice(0, 10)
+    fs.mkdirSync(LOGIN_LOG_DIR, { recursive: true, mode: 0o700 })
+    if (lastLoginLogPrune !== day) {
+      const oldest = beijingTime(Date.now() - (LOGIN_LOG_DAYS - 1) * 86400000).slice(0, 10)
+      for (const name of fs.readdirSync(LOGIN_LOG_DIR)) {
+        const match = name.match(/^login-(\d{4}-\d{2}-\d{2})(?:\.[1-9]\d*)?\.jsonl$/)
+        if (match && match[1] < oldest) fs.unlinkSync(path.join(LOGIN_LOG_DIR, name))
+      }
+      lastLoginLogPrune = day
+    }
+    const file = path.join(LOGIN_LOG_DIR, `login-${day}.jsonl`)
+    if (fs.existsSync(file) && fs.statSync(file).size + Buffer.byteLength(line) > LOGIN_LOG_BYTES) {
+      if (LOGIN_LOG_FILES === 1) fs.unlinkSync(file)
+      else {
+        const oldest = path.join(LOGIN_LOG_DIR, `login-${day}.${LOGIN_LOG_FILES - 1}.jsonl`)
+        if (fs.existsSync(oldest)) fs.unlinkSync(oldest)
+        for (let part = LOGIN_LOG_FILES - 2; part >= 1; part--) {
+          const source = path.join(LOGIN_LOG_DIR, `login-${day}.${part}.jsonl`)
+          if (fs.existsSync(source)) fs.renameSync(source, path.join(LOGIN_LOG_DIR, `login-${day}.${part + 1}.jsonl`))
+        }
+        fs.renameSync(file, path.join(LOGIN_LOG_DIR, `login-${day}.1.jsonl`))
+      }
+    }
+    fs.appendFileSync(file, line, { encoding: 'utf8', mode: 0o600 })
+  } catch (error) {
+    if (Date.now() - lastLoginLogWarning > 60000) {
+      lastLoginLogWarning = Date.now()
+      console.error('LOGIN_AUDIT_WRITE_FAILED', /^[A-Z0-9_]+$/.test(error.code || '') ? error.code : 'LOG_IO_ERROR')
+    }
+  }
+}
+function startLoginAudit(req, res) {
+  let route
+  try { route = new URL(req.url, 'http://localhost').pathname } catch { return null }
+  if (route !== '/api/login') return null
+  const started = Date.now(), id = crypto.randomUUID()
+  const peer = normalizeAddress(req.socket.remoteAddress || 'unknown'), clientIp = clientAddress(req)
+  const audit = { id, started, code: !['POST','OPTIONS'].includes(req.method) ? 'METHOD_NOT_ALLOWED' : '', authentication: 'not_checked', username: '', device: {}, deviceReported: false, hints: [] }
+  res.setHeader('X-Qaletx-Request-Id', id)
+  const record = delivered => {
+    if (audit.recorded) return
+    audit.recorded = true
+    const now = Date.now(), status = res.headersSent ? res.statusCode : null
+    let code = audit.code || (req.method !== 'POST' && req.method !== 'OPTIONS' ? 'METHOD_NOT_ALLOWED' : 'REQUEST_REJECTED')
+    if (!delivered) code = req.aborted ? 'REQUEST_ABORTED' : 'CLIENT_DISCONNECTED'
+    const device = audit.device
+    writeLoginAudit({ schemaVersion: 1, event: req.method === 'OPTIONS' ? 'login_preflight' : 'login_attempt',
+      requestId: id, time: new Date(now).toISOString(), beijingTime: beijingTime(now), startedAt: new Date(started).toISOString(), durationMs: now - started,
+      method: auditText(req.method, 16), path: '/api/login', username: audit.username, deviceReported: audit.deviceReported,
+      deviceId: device.id || null, deviceName: device.name || '未提供设备名称', platform: device.platform || 'unknown', clientVersion: device.version || '未提供客户端版本',
+      clientIp, peerIp: peer, trustedProxy: TRUSTED_PROXIES.has(peer),
+      userAgent: auditText(req.headers['user-agent'], 200, audit.secret), origin: auditText(req.headers.origin, 200, audit.secret),
+      result: delivered && status >= 200 && status < 300 ? 'success' : 'failure', authentication: audit.authentication,
+      httpStatus: status, responseFinished: delivered, reasonCode: code, reason: LOGIN_REASONS[code] || LOGIN_REASONS.REQUEST_REJECTED, inputHints: audit.hints })
+    delete audit.secret
+  }
+  res.once('finish', () => record(true))
+  res.once('close', () => record(false))
+  return audit
+}
+function captureLoginAudit(audit, body) {
+  if (!audit) return
+  const secret = typeof body.password === 'string' ? body.password : ''
+  audit.secret = secret
+  audit.username = auditText(typeof body.username === 'string' ? body.username.trim() : '', 64, secret).toLowerCase()
+  if (typeof body.username === 'string' && body.username !== body.username.trim()) audit.hints.push('USERNAME_OUTER_WHITESPACE')
+  if (secret && secret !== secret.trim()) audit.hints.push('PASSWORD_OUTER_WHITESPACE')
+  if (/[^\x20-\x7e]/.test(secret)) audit.hints.push('PASSWORD_NON_ASCII')
+  const device = body.device
+  audit.deviceReported = Boolean(device && typeof device === 'object' && !Array.isArray(device))
+  if (audit.deviceReported) audit.device = {
+    id: typeof device.id === 'string' && /^[a-zA-Z0-9_-]{8,80}$/.test(device.id) ? auditText(device.id, 80, secret) : '',
+    name: auditText(device.name, 80, secret), platform: auditText(device.platform, 32, secret), version: auditText(device.version, 32, secret),
+  }
+}
+function loginAuditError(audit, error) {
+  if (!audit || audit.code) return
+  audit.code = !(error instanceof HttpError) ? 'INTERNAL_ERROR' : LOGIN_REASONS[error.code] ? error.code : error.status === 429 ? 'RATE_LIMITED'
+    : error.status === 413 ? 'BODY_TOO_LARGE' : error.status === 400 ? 'INVALID_JSON' : 'REQUEST_REJECTED'
+}
 function requireAttempt(req, purpose = 'login') {
   const key = purpose + ':' + clientAddress(req)
   const now = Date.now()
@@ -297,7 +425,7 @@ function send(res, status, body) {
 function readBody(req) {
   if (Number(req.headers['content-length']) > MAX_BODY_BYTES) {
     req.resume()
-    return Promise.reject(new HttpError(413, '请求内容过大，最大 64 KiB'))
+    return Promise.reject(new HttpError(413, '请求内容过大，最大 64 KiB', 'BODY_TOO_LARGE'))
   }
   return new Promise((resolve, reject) => {
     let size = 0
@@ -312,21 +440,21 @@ function readBody(req) {
     req.on('data', chunk => {
       if (finished) return
       size += chunk.length
-      if (size > MAX_BODY_BYTES) return fail(new HttpError(413, '请求内容过大，最大 64 KiB'))
+      if (size > MAX_BODY_BYTES) return fail(new HttpError(413, '请求内容过大，最大 64 KiB', 'BODY_TOO_LARGE'))
       chunks.push(chunk)
     })
     req.on('end', () => {
       if (finished) return
       let body
       try { body = size ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {} }
-      catch { return fail(new HttpError(400, '请求必须是有效的 JSON')) }
-      if (!body || typeof body !== 'object' || Array.isArray(body)) return fail(new HttpError(400, '请求必须是 JSON 对象'))
+      catch { return fail(new HttpError(400, '请求必须是有效的 JSON', 'INVALID_JSON')) }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return fail(new HttpError(400, '请求必须是 JSON 对象', 'INVALID_JSON'))
       finished = true
       chunks = []
       resolve(body)
     })
-    req.on('error', () => fail(new HttpError(400, '请求读取失败')))
-    req.on('aborted', () => fail(new HttpError(400, '请求已中断')))
+    req.on('error', () => fail(new HttpError(400, '请求读取失败', 'BODY_READ_ERROR')))
+    req.on('aborted', () => fail(new HttpError(400, '请求已中断', 'REQUEST_ABORTED')))
   })
 }
 function decodeName(value) {
@@ -567,27 +695,36 @@ async function managementRoute(req,res,url,actor) {
   return false
 }
 const server = http.createServer(async (req, res) => {
+  const loginAudit = startLoginAudit(req, res)
   try {
     const origin = req.headers.origin
-    if (origin && !CORS_ORIGINS.includes('*') && !CORS_ORIGINS.includes(origin)) throw new HttpError(403, '不允许此页面来源')
+    if (origin && !CORS_ORIGINS.includes('*') && !CORS_ORIGINS.includes(origin)) {
+      if (loginAudit) loginAudit.code = 'CORS_BLOCKED'
+      throw new HttpError(403, '不允许此页面来源')
+    }
     res.setHeader('Vary', 'Origin')
     if (origin) res.setHeader('Access-Control-Allow-Origin', CORS_ORIGINS.includes('*') ? '*' : origin)
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS')
-    if (req.method === 'OPTIONS') return send(res, 204)
+    if (req.method === 'OPTIONS') { if (loginAudit) loginAudit.code = 'PREFLIGHT_OK'; return send(res, 204) }
     let url
     try { url = new URL(req.url, 'http://localhost') } catch { throw new HttpError(400, '请求路径无效') }
-    if (req.method === 'GET' && url.pathname === '/api/health') return send(res, 200, { ok: true, service: 'qaletx-link-server', time: new Date().toISOString() })
+    if (req.method === 'GET' && url.pathname === '/api/health') return send(res, 200, { ok: true, service: 'qaletx-link-server', time: new Date().toISOString(), loginAudit: true })
     if (req.method === 'POST' && url.pathname === '/api/login') {
       requireAttempt(req)
-      const { username, password, device } = await readBody(req)
-      if(device!==undefined&&(!device||typeof device!=='object'||Array.isArray(device)))throw new HttpError(400,'设备信息格式无效')
-      if (typeof username !== 'string' || username.length > 64 || !passwordValid(password)) throw new HttpError(400, '账号或密码格式不正确')
+      const body = await readBody(req)
+      captureLoginAudit(loginAudit, body)
+      const { username, password, device } = body
+      if(device!==undefined&&(!device||typeof device!=='object'||Array.isArray(device))){loginAudit.code='INVALID_DEVICE';throw new HttpError(400,'设备信息格式无效')}
+      if (typeof username !== 'string' || username.length > 64 || !passwordValid(password)) { loginAudit.code='INVALID_INPUT'; throw new HttpError(400, '账号或密码格式不正确') }
       const user = users.find(item => item.username === username.trim().toLowerCase())
       const correct = verifyPassword(password, user || dummyPassword)
-      if (!user || !correct) throw new HttpError(401, '用户名或密码不正确')
-      if (!isActive(user)) throw new HttpError(403, user.disabled ? '账号已停用，请联系管理员' : '账号已到期，请联系管理员')
-      const token = issueToken(user.username,device)
+      if (!user || !correct) { loginAudit.authentication='failure';loginAudit.code=user?'BAD_PASSWORD':'ACCOUNT_NOT_FOUND';throw new HttpError(401, '用户名或密码不正确') }
+      if (!isActive(user)) { loginAudit.authentication='failure';loginAudit.code=user.disabled?'ACCOUNT_DISABLED':'ACCOUNT_EXPIRED';throw new HttpError(403, user.disabled ? '账号已停用，请联系管理员' : '账号已到期，请联系管理员') }
+      let token
+      try { token = issueToken(user.username,device) }
+      catch(error){loginAudit.code=error.status===503?'SESSION_LIMIT':error.status===400?'INVALID_DEVICE':'INTERNAL_ERROR';throw error}
+      loginAudit.authentication='success';loginAudit.code='SUCCESS'
       return send(res, 200, { token, user: safeUser(user) })
     }
     if (req.method === 'POST' && url.pathname === '/api/logout') {
@@ -789,9 +926,10 @@ const server = http.createServer(async (req, res) => {
     }
     throw new HttpError(404, '接口不存在')
   } catch (error) {
-    if (error instanceof HttpError) return send(res, error.status, { error: error.message, ...(error.code?{code:error.code}:{}) })
+    loginAuditError(loginAudit, error)
+    if (error instanceof HttpError) return send(res, error.status, { error: error.message, ...(error.code?{code:error.code}:{}), ...(loginAudit?{requestId:loginAudit.id}:{}) })
     console.error('API error:', error.code || error.name)
-    return send(res, 500, { error: '服务器内部错误，请查看服务日志' })
+    return send(res, 500, { error: '服务器内部错误，请查看服务日志', ...(loginAudit?{requestId:loginAudit.id}:{}) })
   }
 })
 
